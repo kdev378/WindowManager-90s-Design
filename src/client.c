@@ -42,8 +42,6 @@
 #define WM_HINTS_LEN        9           /* CARD32 9 語 */
 
 /* _MOTIF_WM_HINTS (§3.2) */
-#define MWM_HINTS_LEN         5         /* CARD32 5 語 */
-#define MWM_HINTS_DECORATIONS (1u << 1) /* flags: decorations が有効 */
 
 /* frame のイベントマスク。
  * SubstructureRedirect/Notify は子（クライアント）の要求を横取りするため、
@@ -116,24 +114,6 @@ static bool client_is_csd(const struct client *c)
 	return (c->flags & CF_CSD) != 0;
 }
 
-/*
- * _MOTIF_WM_HINTS の decorations が 0 か (§3.2)。
- * flags に MWM_HINTS_DECORATIONS が立っていて、かつ decorations == 0 の時だけ真。
- * ヘッダに専用の icccm_* 読み取りが無いためここで読む（Phase 3 で icccm.c へ移す）。
- */
-static bool motif_says_undecorated(xcb_window_t win)
-{
-	uint32_t hints[MWM_HINTS_LEN];
-	size_t n;
-
-	memset(hints, 0, sizeof hints);
-	n = get_card32_prop(win, atoms[ATOM_MOTIF_WM_HINTS], hints, MWM_HINTS_LEN);
-	if (n < 3)
-		return false;
-	if ((hints[0] & MWM_HINTS_DECORATIONS) == 0)
-		return false;
-	return hints[2] == 0;
-}
 
 /*
  * WM_HINTS.initial_state == Iconic か (ICCCM §4.1.2.4, §4.1.4)。
@@ -203,7 +183,7 @@ bool client_decides_decoration(struct client *c)
 	/* force_ssd は _MOTIF_WM_HINTS と CSD 判定を無視して装飾を強制する
 	 * best-effort モード (§7.2)。全画面と種別表には効かせない。 */
 	if (!wm.cfg.force_ssd) {
-		if (motif_says_undecorated(c->win))
+		if (c->motif_seen && c->motif_no_deco)   /* motif.c がキャッシュ済み (§3.2) */
 			return false;
 		if (client_is_csd(c))
 			return false;
@@ -593,6 +573,7 @@ struct client *client_manage(xcb_window_t win, bool adopting)
 
 	shape_apply(c);                /* 非矩形ウィンドウの形状追従 (§5.3、任意) */
 
+
 	/* デスクトップの決定 (§3.8) */
 	if (prop_get_card32(c->win, atoms[ATOM_NET_WM_DESKTOP],
 	                    XCB_ATOM_CARDINAL, &desktop)) {
@@ -628,6 +609,17 @@ struct client *client_manage(xcb_window_t win, bool adopting)
 	client_apply_geometry(c);
 
 	stack_add(c);
+
+	/*
+	 * 作業領域の再計算 (§3.5.2)。
+	 * **map より前に strut を設定するクライアントがある**（パネルの通常の
+	 * 手順）。その場合こちらがイベントを選ぶ前にプロパティが立っているので
+	 * PropertyNotify は届かない。管理開始時に必ず一度計算する。
+	 * **stack_add より後で呼ぶこと** —— layout_update_workareas() は
+	 * スタックリストを走査して strut を集めるので、リストに載る前に
+	 * 呼ぶとこのクライアントの strut が見えない。
+	 */
+	layout_update_workareas();
 	focus_mru_promote(c);   /* MRU に載せる。実際のフォーカス付与は focus.c の判断 */
 	wm.n_clients++;
 
@@ -762,6 +754,8 @@ void client_unmanage(struct client *c, bool destroyed)
 	 * 先に外すのは、focus_next_after() が候補走査でこの client を拾わないため。 */
 	focus_mru_remove(c);
 	stack_remove(c);
+	/* パネルが閉じたら作業領域を返す (§3.5.2) */
+	layout_update_workareas();
 	if (wm.n_clients > 0)
 		wm.n_clients--;
 

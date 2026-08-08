@@ -654,6 +654,11 @@ void layout_maximize(struct client *c, bool vert, bool horz, bool on)
 	client_apply_geometry(c);
 	ewmh_set_wm_state(c);
 	ewmh_set_allowed_actions(c);
+	/*
+	 * CSD の再計算は allowed_actions の後（Motif の制限を上書きしないため）、
+	 * stack_apply の前。CSD でなければ即 return するので SSD には影響しない (§7.2)。
+	 */
+	csd_state_changed(c);
 	stack_apply();
 }
 
@@ -710,11 +715,14 @@ void layout_fullscreen(struct client *c, bool on)
 			c->flags |= CF_DECORATED;
 	}
 
-	/* GTK は全画面時に _GTK_FRAME_EXTENTS を 0 にするため、遷移のたびに読み直す (§7.2) */
-	icccm_update_gtk_extents(c);
-
 	client_apply_geometry(c);
 	ewmh_set_wm_state(c);
 	ewmh_set_allowed_actions(c);
+	/*
+	 * GTK は全画面時に _GTK_FRAME_EXTENTS を 0 にするため、遷移のたびに
+	 * 読み直して可視矩形 V を基準に再計算する (§7.2)。
+	 * allowed_actions の後に置くのは Motif の制限を上書きしないため。
+	 */
+	csd_state_changed(c);
 	stack_apply();
 }

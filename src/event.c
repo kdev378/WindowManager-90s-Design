@@ -169,6 +169,20 @@ static void on_unmap_notify(xcb_unmap_notify_event_t *e)
 		return;
 
 	/*
+	 * **1 回の UnmapWindow で UnmapNotify は 2 通届く。**
+	 *   - クライアントに選んだ StructureNotify   → event == window == c->win
+	 *   - フレームに選んだ SubstructureNotify    → event == c->frame
+	 * 両方を数えると、下の unmap_pending（1 回の unmap につき 1 加算）が
+	 * 足りず、2 通目が「クライアント自身による withdraw」と誤判定されて
+	 * ウィンドウが unmanage される。最小化すると窓が消える、という形で出た。
+	 *
+	 * フレーム経由の 1 通だけを正とする。フレームがまだ無い（adopt 前）
+	 * 場合のみ StructureNotify 側を受ける。
+	 */
+	if (c->frame != XCB_WINDOW_NONE && e->event != c->frame)
+		return;
+
+	/*
 	 * SPEC §3.8: WM 起因の Unmap（reparent / 最小化 / デスクトップ切替）は
 	 * 同一カウンタで無視する。ここを誤ると「ウィンドウが勝手に消える」
 	 * という最も追いにくいバグになる。
@@ -194,6 +208,28 @@ static void on_destroy_notify(xcb_destroy_notify_event_t *e)
 	}
 }
 
+/*
+ * 装飾の有無を再判定して反映する。
+ *
+ * client_decides_decoration() は「装飾すべきか」を返すだけで
+ * CF_DECORATED を書き換えない。戻り値を捨てると、種別や Motif ヒントが
+ * 後から変わってもフラグが古いままになり、_NET_FRAME_EXTENTS も
+ * ずれ続ける（実際にそのバグを踏んでいた）。
+ */
+static void refresh_decoration(struct client *c)
+{
+	uint32_t before = c->flags & CF_DECORATED;
+
+	c->flags &= ~(uint32_t)CF_DECORATED;
+	if (client_decides_decoration(c))
+		c->flags |= CF_DECORATED;
+
+	client_apply_geometry(c);
+	client_update_frame_extents(c);
+	if ((c->flags & CF_DECORATED) != before || (c->flags & CF_DECORATED))
+		deco_invalidate(c);
+}
+
 static void on_property_notify(xcb_property_notify_event_t *e)
 {
 	struct client *c;
@@ -217,15 +253,13 @@ static void on_property_notify(xcb_property_notify_event_t *e)
 		stack_apply();
 	} else if (e->atom == atoms[ATOM_NET_WM_WINDOW_TYPE]) {
 		icccm_update_window_type(c);
-		client_decides_decoration(c);
+		refresh_decoration(c);
 		stack_apply();
 	} else if (e->atom == atoms[ATOM_GTK_FRAME_EXTENTS]) {
 		csd_state_changed(c);          /* §7.2 遷移のたびに読み直す */
 	} else if (e->atom == atoms[ATOM_MOTIF_WM_HINTS]) {
 		motif_update(c);
-		client_decides_decoration(c);
-		client_apply_geometry(c);
-		deco_invalidate(c);
+		refresh_decoration(c);
 	} else if (e->atom == atoms[ATOM_NET_WM_ICON]) {
 		icon_update(c);                /* §4.4.1 */
 		deco_invalidate(c);

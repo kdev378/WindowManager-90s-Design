@@ -418,6 +418,14 @@ static void apply_key(struct config *cfg, const char *key, char *value)
 	bool b;
 	long n;
 
+	if (strcmp(key, "force.ssd") == 0) {
+		/* §7.2: CSD/Motif の装飾抑止を無視して強制的に装飾する。
+		 * GTK 側のタイトルバーは消せないので二重になる。非推奨 */
+		if (!parse_bool(value, &cfg->force_ssd))
+			ERR("config: force.ssd の値が不正です: '%s'", value);
+		return;
+	}
+
 	if (strcmp(key, "theme") == 0) {
 		int idx;
 

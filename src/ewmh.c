@@ -73,6 +73,8 @@ void ewmh_init(void)
 	                     (uint32_t)(inst_len + class_len), class_buf);
 
 	ewmh_update_supported();
+	/* 起動時から存在させる。pager は値の有無で対応を判断する */
+	ewmh_update_showing_desktop();
 }
 
 void ewmh_update_supported(void)
@@ -413,6 +415,112 @@ static void handle_net_wm_state(xcb_client_message_event_t *ev, struct client *c
 	}
 }
 
+
+/* ================================================================== *
+ * デスクトップの表示 (_NET_SHOWING_DESKTOP)
+ *
+ * 自分が隠したウィンドウだけを記録しておく。これが無いと、
+ * 元から最小化されていたウィンドウまで復元してしまう。
+ * ================================================================== */
+static bool showing_desktop;
+static xcb_window_t hidden_by_us[WM_MAX_CLIENTS];
+static uint16_t n_hidden;
+
+void ewmh_update_showing_desktop(void)
+{
+	uint32_t v = showing_desktop ? 1u : 0u;
+	xcb_change_property(wm.conn, XCB_PROP_MODE_REPLACE, wm.root,
+		atoms[ATOM_NET_SHOWING_DESKTOP], XCB_ATOM_CARDINAL, 32, 1, &v);
+}
+
+static void showing_desktop_set(bool on)
+{
+	struct client *c;
+	uint16_t i;
+
+	if (on == showing_desktop)
+		return;
+	showing_desktop = on;
+
+	if (on) {
+		n_hidden = 0;
+		for (c = wm.stack_bottom; c; c = c->next) {
+			if (c->flags & CF_ICONIC)
+				continue;                  /* 元から最小化。触らない */
+			if (c->type == TYPE_DESKTOP || c->type == TYPE_DOCK)
+				continue;
+			if (!client_visible_on(c, wm.current_desktop))
+				continue;
+			if (n_hidden < WM_MAX_CLIENTS)
+				hidden_by_us[n_hidden++] = c->win;
+			client_iconify(c);
+		}
+	} else {
+		for (i = 0; i < n_hidden; i++) {
+			c = client_find(hidden_by_us[i]);
+			if (c != NULL)
+				client_deiconify(c);
+		}
+		n_hidden = 0;
+	}
+	ewmh_update_showing_desktop();
+	stack_apply();
+}
+
+/* ================================================================== *
+ * フォーカススティール防止 (SPEC §3.6)
+ * ================================================================== */
+
+void ewmh_set_demands_attention(struct client *c, bool on)
+{
+	if (on)
+		c->states |= ST_DEMANDS_ATTENTION;
+	else
+		c->states &= ~(uint32_t)ST_DEMANDS_ATTENTION;
+	ewmh_set_wm_state(c);
+	/* Phase 4 でタスクバーのボタンを点滅させる。今は状態ビットのみ。 */
+}
+
+bool ewmh_allow_activation(struct client *c, uint32_t source, xcb_timestamp_t t)
+{
+	uint32_t utime = c->user_time;
+
+	/* source 2 = pager。利用者の明示操作なので常に許可 (EWMH) */
+	if (source == 2)
+		return true;
+
+	/*
+	 * _NET_WM_USER_TIME_WINDOW が指定されていれば、user time は
+	 * そちらのウィンドウのプロパティに載っている (§3.6)。
+	 */
+	if (c->user_time_win != XCB_WINDOW_NONE) {
+		uint32_t v;
+		if (prop_get_card32(c->user_time_win, atoms[ATOM_NET_WM_USER_TIME],
+		                    XCB_ATOM_CARDINAL, &v))
+			utime = v;
+	}
+
+	/* user_time == 0 は「このウィンドウはフォーカスを望まない」の明示 */
+	if (utime == 0 && c->user_time_win != XCB_WINDOW_NONE) {
+		ewmh_set_demands_attention(c, true);
+		return false;
+	}
+
+	/*
+	 * 直近の利用者操作より古い要求は自己アクティブ化とみなして拒否する。
+	 * X のタイムスタンプは 32bit で巻き戻るため、差の符号で比較する。
+	 */
+	if (utime != 0 && wm.last_time != 0 &&
+	    (int32_t)(utime - wm.last_time) < 0) {
+		ewmh_set_demands_attention(c, true);
+		return false;
+	}
+
+	(void)t;
+	ewmh_set_demands_attention(c, false);
+	return true;
+}
+
 bool ewmh_handle_client_message(xcb_client_message_event_t *ev)
 {
 	int idx = atoms_lookup(ev->type);
@@ -435,6 +543,120 @@ bool ewmh_handle_client_message(xcb_client_message_event_t *ev)
 			                      (int16_t)ev->data.data32[2]);
 		return true;
 
+	/*
+	 * _NET_MOVERESIZE_WINDOW (EWMH)
+	 * data32[0]: bit0-7=gravity, bit8-11=x/y/w/h の指定有無, bit12-13=source
+	 * data32[1..4]: x, y, width, height
+	 */
+	case ATOM_NET_MOVERESIZE_WINDOW: {
+		uint32_t fl = ev->data.data32[0];
+		uint8_t  grav = (uint8_t)(fl & 0xff);
+		struct rect g;
+
+		c = client_find(ev->window);
+		if (c == NULL)
+			return true;
+
+		g = c->geom;
+		if (fl & (1u << 8))  g.x = (int16_t)ev->data.data32[1];
+		if (fl & (1u << 9))  g.y = (int16_t)ev->data.data32[2];
+		if (fl & (1u << 10)) g.w = (uint16_t)ev->data.data32[3];
+		if (fl & (1u << 11)) g.h = (uint16_t)ev->data.data32[4];
+
+		hints_apply(&c->hints, &g.w, &g.h);
+		c->geom = g;
+		/* gravity 0 は「ウィンドウの win_gravity を使う」の意 (EWMH) */
+		if (fl & ((1u << 8) | (1u << 9)))
+			icccm_apply_gravity(c, grav ? grav : c->hints.gravity,
+			                    0, 0, &c->geom.x, &c->geom.y);
+		c->restore = c->geom;
+		client_apply_geometry(c);
+		client_send_configure(c);
+		return true;
+	}
+
+	/*
+	 * _NET_WM_MOVERESIZE (EWMH)
+	 * data32: [0]=x_root [1]=y_root [2]=direction [3]=button [4]=source
+	 * direction 0-7 = 8 方向のリサイズ, 8 = 移動,
+	 *           9 = キーボードサイズ, 10 = キーボード移動,
+	 *           11 = **CANCEL** (§7.2 で必須。CSD アプリが Esc で使う)
+	 */
+	case ATOM_NET_WM_MOVERESIZE: {
+		static const uint8_t dir_edge[8] = {
+			EDGE_T | EDGE_L, EDGE_T, EDGE_T | EDGE_R, EDGE_R,
+			EDGE_B | EDGE_R, EDGE_B, EDGE_B | EDGE_L, EDGE_L
+		};
+		uint32_t dir = ev->data.data32[2];
+		int16_t rx = (int16_t)ev->data.data32[0];
+		int16_t ry = (int16_t)ev->data.data32[1];
+
+		c = client_find(ev->window);
+		if (c == NULL)
+			return true;
+
+		if (dir == 11) {                       /* CANCEL */
+			if (move_active())
+				move_end(true);
+		} else if (dir <= 7) {
+			move_begin(c, DRAG_RESIZE, dir_edge[dir], rx, ry, wm.last_time);
+		} else if (dir == 8 || dir == 10) {
+			move_begin(c, DRAG_MOVE, 0, rx, ry, wm.last_time);
+		} else if (dir == 9) {
+			move_begin(c, DRAG_RESIZE, EDGE_B | EDGE_R, rx, ry, wm.last_time);
+		}
+		return true;
+	}
+
+	/* _NET_RESTACK_WINDOW: [0]=source [1]=sibling [2]=detail */
+	case ATOM_NET_RESTACK_WINDOW: {
+		struct client *sib;
+
+		c = client_find(ev->window);
+		if (c == NULL)
+			return true;
+		sib = client_find((xcb_window_t)ev->data.data32[1]);
+		/* 兄弟指定は stack.c に相対順序の API が無いため、
+		 * detail に応じた最上位/最下位への移動で近似する。
+		 * (兄弟の直上/直下への挿入は Phase 4 で stack.c を拡張する) */
+		(void)sib;
+		if (ev->data.data32[2] == XCB_STACK_MODE_BELOW)
+			stack_lower(c);
+		else
+			stack_raise(c);
+		stack_apply();
+		return true;
+	}
+
+	/*
+	 * _NET_REQUEST_FRAME_EXTENTS
+	 * クライアントは **map する前に** 装飾の厚みを問い合わせてくる。
+	 * まだ管理下に無いので、種別と Motif ヒントだけ読んで見積もる。
+	 * ここを返さないとアプリが初期サイズを誤る。
+	 */
+	case ATOM_NET_REQUEST_FRAME_EXTENTS: {
+		uint32_t ext[4] = { 0, 0, 0, 0 };
+		const struct metrics *m = theme_metrics();
+
+		c = client_find(ev->window);
+		if (c != NULL) {
+			uint16_t l, r, t, b;
+			client_frame_offsets(c, &l, &r, &t, &b);
+			ext[0] = l; ext[1] = r; ext[2] = t; ext[3] = b;
+		} else {
+			/* 未管理。既定の装飾 (通常ウィンドウ) を仮定する */
+			ext[0] = ext[1] = ext[3] = m->border_sizing;
+			ext[2] = (uint32_t)(m->border_sizing + m->caption_h);
+		}
+		xcb_change_property(wm.conn, XCB_PROP_MODE_REPLACE, ev->window,
+			atoms[ATOM_NET_FRAME_EXTENTS], XCB_ATOM_CARDINAL, 32, 4, ext);
+		return true;
+	}
+
+	case ATOM_NET_SHOWING_DESKTOP:
+		showing_desktop_set(ev->data.data32[0] != 0);
+		return true;
+
 	case ATOM_NET_WM_STATE:
 		c = client_find(ev->window);
 		if (c != NULL)
@@ -444,9 +666,18 @@ bool ewmh_handle_client_message(xcb_client_message_event_t *ev)
 	case ATOM_NET_ACTIVE_WINDOW:
 		c = client_find(ev->window);
 		if (c != NULL) {
+			uint32_t source = ev->data.data32[0];
 			xcb_timestamp_t time = (xcb_timestamp_t)ev->data.data32[1];
-			stack_raise(c);
-			focus_set(c, time);
+
+			/* フォーカススティール防止 (§3.6)。拒否した場合は
+			 * DEMANDS_ATTENTION に落とすので要求は無視されない。 */
+			if (ewmh_allow_activation(c, source, time)) {
+				if (c->flags & CF_ICONIC)
+					client_deiconify(c);
+				stack_raise(c);
+				stack_apply();
+				focus_set(c, time);
+			}
 		}
 		return true;
 
@@ -457,19 +688,18 @@ bool ewmh_handle_client_message(xcb_client_message_event_t *ev)
 		return true;
 
 	case ATOM_NET_CURRENT_DESKTOP:
-		/* 実際のデスクトップ切替（フレームの map/unmap, §3.8）を行う
-		 * ヘルパが w98wm.h に公開されていないため、ここではプロパティの
-		 * 更新のみ行う。呼び出し側モジュールが別途切替処理を持つ想定。 */
-		if (ev->data.data32[0] < wm.n_desktops)
-			wm.current_desktop = ev->data.data32[0];
+		/* frame の map/unmap を伴う実切替 (§3.8) */
+		desktop_switch(ev->data.data32[0]);
 		ewmh_update_desktop_props();
 		return true;
 
 	case ATOM_NET_WM_DESKTOP:
-		/* 同上。クライアントの所属デスクトップの記録のみ行う。 */
 		c = client_find(ev->window);
-		if (c != NULL)
-			c->desktop = ev->data.data32[0];
+		if (c != NULL) {
+			uint32_t d = ev->data.data32[0];
+			if (d == WM_ALL_DESKTOPS || d < wm.n_desktops)
+				client_set_desktop(c, d);   /* 表示/非表示も伴う */
+		}
 		return true;
 
 	case ATOM_WM_CHANGE_STATE:

@@ -247,6 +247,8 @@ struct client {
 	/* _MOTIF_WM_HINTS (§3.2)。読み取り結果をキャッシュする */
 	bool         motif_seen;
 	bool         motif_no_deco;
+	bool         motif_funcs_valid;   /* MWM_HINTS_FUNCTIONS があったか */
+	uint32_t     motif_funcs;         /* 展開済みの許可ビット (MWM_FUNC_*) */
 
 	/* 装飾の対話状態 (§4.4)。ボタンのホバー/押下 */
 	uint8_t      hover_part;  /* enum frame_part */
