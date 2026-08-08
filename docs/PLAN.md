@@ -30,8 +30,13 @@ Phase 3 の減分は Xinerama 経路を実装しないと確定したこと（SP
 **目的**: 以降の全フェーズで「作る → 動かす → 測る」を 1 コマンドで回せるようにする。
 
 - `Makefile`（POSIX make。GNU make / BSD make 双方で動くこと。cmake/meson は使わない）
-  - `make`, `make DEBUG=1`, `make XFT=1`, `make STATIC=1`, `make install`
+  - `make`（core プロファイル）, `make DEBUG=1`, `make XFT=1`, `make STATIC=1`, `make install`
   - 依存検出は `pkg-config` があれば使い、無ければ既定パスにフォールバック
+  - **必須依存**: `xcb`, `xcb-randr`, `xcb-sync`, `xcb-keysyms`
+    （`xcb-sync` は `_NET_WM_SYNC_REQUEST` に必要。SPEC §1.4）
+  - **任意依存**: `xcb-shape`, `xcb-xfixes`（無い場合は該当機能を無効化してビルド継続）
+- `src/atoms.c` — アトムテーブルと `implemented` フラグ（SPEC §5.2.1）。
+  `_NET_SUPPORTED` はこのフラグから生成する。フェーズ進行に伴って昇格させる
 - `src/compat.h` — Linux / OpenBSD の差分吸収（`strlcpy`, `pledge`, `posix_spawn`, poll）
 - `src/util.c` — スラブアロケータ、ログ（`-v` で stderr、既定は無出力）
 - `tools/run-xephyr.sh` — Xephyr 上で w98wm を起動し、テスト用アプリを配置する
@@ -39,6 +44,8 @@ Phase 3 の減分は Xinerama 経路を実装しないと確定したこと（SP
   0 枚の測定（M0/M1）を Phase 0 の時点から取り始めることで、以降のフェーズで
   「常駐の底が上がった」のか「ウィンドウ単価が増えた」のかを毎回切り分けられるようにする
 - `tools/compat-matrix.sh` — §7.1 のアプリを順に起動し、手動確認用チェックリストを出す
+- `tools/check-supported.sh` — `_NET_SUPPORTED` に載っている各アトムに対応する結合テストが
+  存在するかを機械的に検査する（SPEC §5.2.1。テストの無いアトムが載っていたら CI 失敗）
 - GitHub Actions: Ubuntu（gcc/clang, glibc/musl）でビルド + Xvfb 起動テスト + メモリ閾値チェック
   - OpenBSD は CI に無いため、`make -n` 相当の構文検査 + 手動検証手順を記載
 
@@ -64,8 +71,11 @@ Phase 3 の減分は Xinerama 経路を実装しないと確定したこと（SP
    モーション合体・16ms レート上限・「未確定リクエストは 1 つまで」のフックを最初から
    入れておく。ここを素朴に書いて後から直すと、イベントループ全体の構造に手が入るため。
    同期カウンタ（§7.3）は Phase 3 で差し込むが、その差し込み口だけ用意しておく
-9. スタッキング（レイヤ管理）
+9. スタッキング（SPEC §3.7 のレイヤ + transient チェーン。
+   **`transient_for` の循環検出を最初から入れる** — 無防備だと無限ループでハングする）
 10. キーバインド基盤（`XGrabKey`、`MappingNotify` 対応）と `exec`
+    （`posix_spawn` + SIGCHLD を `SIG_IGN`、子側は `POSIX_SPAWN_SETSIGDEF` で戻す。
+    SPEC §2.2.1）
 11. 終了時のクリーンアップ（全クライアントを root へ reparent し直す）
 
 **この時点の見た目**: 装飾は単色の灰色矩形（プレースホルダ）。
@@ -109,17 +119,23 @@ Phase 3 の減分は Xinerama 経路を実装しないと確定したこと（SP
 
 1. アトム一括取得（起動時に 1 往復でまとめて `InternAtom`）
 2. ルートプロパティ群と、クライアントプロパティ群の読み書き
-3. `_NET_WM_STATE` の全状態と、クライアントメッセージによる変更（`_NET_WM_STATE` 1/0/2=toggle）
-4. `_NET_WM_WINDOW_TYPE` によるレイヤと装飾の決定
+3. `_NET_WM_STATE` の全状態と、クライアントメッセージによる変更（`_NET_WM_STATE` 1/0/2=toggle）。
+   **FULLSCREEN は最上層に固定せず、フォーカス時のみ**（SPEC §3.7.1）
+4. `_NET_WM_WINDOW_TYPE` によるレイヤと装飾の決定（SPEC §5.2.2 の全 13 種の表を実装。
+   ATOM 配列の走査と、認識できない ATOM の読み飛ばしを含む）
 5. RandR: 1.5 の MONITOR 列挙（無ければ 1.2 の CRTC 列挙）、`RRScreenChangeNotify` に
    よるホットプラグ追従、モニタ跨ぎの最大化・全画面、`_NET_WM_FULLSCREEN_MONITORS`。
    **Xinerama 経路は書かない**（SPEC §5.3 で非対応と確定）
 6. `_NET_WM_STRUT_PARTIAL` 収集 → `_NET_WORKAREA` 算出（複数パネル・複数モニタ対応）
 7. `_NET_WM_SYNC_REQUEST`（SPEC §7.3 の状態機械を Phase 1 のペーシング機構に差し込む。
-   アラーム作成 → IDLE/WAITING/STALLED 遷移 → 250ms タイムアウト。
-   **応答しないクライアントでリサイズが固まらないこと**を明示的にテストする）
+   **リクエストごとの `ChangeAlarm` による trigger 値更新**を忘れないこと（忘れると
+   初回しか発火しない）。IDLE/WAITING/STALLED 遷移、250ms タイムアウト、
+   ボタン解放時の target 再採番。**応答しないクライアントでリサイズが固まらないこと**を
+   模擬クライアント（カウンタを持つが更新しない）で明示的にテストする）
 8. `_NET_WM_PING`（無応答検出 →「応答なし」表示と強制終了ダイアログ）
-9. `_MOTIF_WM_HINTS` と `_GTK_FRAME_EXTENTS`（CSD 対応、§7.2）
+9. `_MOTIF_WM_HINTS` と `_GTK_FRAME_EXTENTS`（CSD 対応、SPEC §7.2 の表に沿って
+   visible rect 基準のジオメトリ計算まで実装。**最大化・全画面の遷移ごとに
+   `_GTK_FRAME_EXTENTS` を読み直す**こと）
 10. `_NET_WM_USER_TIME` によるフォーカススティール防止
 11. Shape 拡張への追従（任意）
 
@@ -151,7 +167,9 @@ Phase 3 の減分は Xinerama 経路を実装しないと確定したこと（SP
 2. `pledge(2)`：X 接続確立後に `stdio rpath wpath cpath unix proc exec` へ絞る。
    `exec` が必要なのは子プロセス起動のため。起動しない構成では更に絞る
 3. `unveil(2)`：設定ディレクトリ・X ソケット・`/usr/X11R6` 等に限定
-4. musl 静的リンク版のビルド（Alpine コンテナで検証、単一バイナリ配布）
+4. musl 静的リンク版のビルド（Alpine コンテナで検証、単一バイナリ配布）。
+   **experimental 扱い**とし、正式サポートは動的リンクの core ビルド（SPEC §1.4）。
+   バイナリサイズの実測目標は約 400 KB（`Private_Dirty` の改善手段ではない）
 5. メモリ削減の実測ベース最適化
    - `bloaty` / `nm --size-sort` で .data/.bss を洗う
    - `valgrind --tool=massif` でヒープのピークと形を確認
@@ -198,6 +216,9 @@ Phase 3 の減分は Xinerama 経路を実装しないと確定したこと（SP
 | 大きな iso10646 フォントへの `QueryFont` で数百 KB の一時リプライ | メモリ目標を単独で脅かす | SPEC §4.5.2 で 16bit フォントへの `QueryFont` を禁止し、`QueryTextExtents` に限定 |
 | ドラッグのペーシング不足 | 低速リモート X でカクつく。後から直すとイベントループの構造に手が入る | SPEC §3.4.1 を Phase 1 の必須項目とし、遅延を入れた環境での検証を Phase 1 の完了条件に含める |
 | `_NET_WM_SYNC_REQUEST` 待ちで無応答クライアントが操作を固める | リサイズ操作全体がハングして見える | 250ms タイムアウトで STALLED に落として続行（SPEC §7.3）。無応答クライアントを模したテストプログラムを用意 |
+| `transient_for` の循環（壊れたアプリ・悪意ある入力） | スタッキング計算が無限ループしてハング | 深さ 16 段の制限と既訪問集合による循環検出（SPEC §3.7.2）。Phase 1 の単体テストに循環ケースを入れる |
+| `_NET_WM_ICON` が巨大（256×256 で 1 枚 256 KB） | 読み込み時にメモリ目標を一時的に破る／サーバ側リソースが増え続ける | プロパティの分割読み込み、一辺 256 超の除外、クライアントあたり Pixmap 1 枚、変更時の即時解放（SPEC §4.4.1） |
+| `_NET_SUPPORTED` に未完成のアトムを載せてしまう | クライアントが「対応済み」と誤認して不具合を起こす | アトムテーブルの `implemented` フラグから生成し、テストの無いアトムが載っていたら CI 失敗（SPEC §5.2.1） |
 | GTK4 CSD アプリの見た目が Win98 にならない | 統一感の欠如 | 仕様として「CSD アプリは自前装飾のまま」と明記。`force_ssd` は best-effort |
 | ICCCM/EWMH の実装漏れによる個別アプリの不具合 | 実用性の毀損 | Phase 3 完了時点で §7.1 の全アプリを通す。COMPAT.md に結果を残す |
 | OpenBSD 実機の検証環境 | 移植品質 | Phase 5 で VM 検証。CI が無い分、手動チェックリストを整備 |

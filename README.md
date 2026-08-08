@@ -6,9 +6,15 @@ Windows 98 のルック＆フィールを再現する、X11 用の超軽量リ�
 
 対象: **Linux**（glibc / musl）と **OpenBSD**。ウィンドウシステムは **X11** のみ。
 
-- 依存は libxcb のみ（Xlib / GTK / cairo / fontconfig を使いません）
+- 依存は libxcb 系のみ（Xlib / GTK / cairo / fontconfig を使いません）
 - ICCCM 2.0 / EWMH 1.5 / Motif WM Hints に準拠
 - タスクバー・スタートメニュー・システムトレイを内蔵（無効化可能）
+
+ビルドプロファイルは 2 つあります。**core**（既定）は libxcb 系のみで、メモリ目標が
+適用されます。**xft**（`make XFT=1`）はアンチエイリアスと確実な多言語表示が得られる
+代わりに、fontconfig/FreeType 依存となりメモリ目標の対象外です。
+core ビルドでの日本語タイトル表示は、環境にある X コアフォント次第の best-effort です
+（詳細は SPEC §4.5.5）。
 
 ## ドキュメント
 
