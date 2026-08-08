@@ -195,6 +195,7 @@ struct client {
 	uint32_t     desktop;     /* WM_ALL_DESKTOPS で全面表示 */
 
 	uint16_t     border_orig; /* reparent 前の border_width。復元用 (§3.1.0) */
+	uint8_t      initial_state; /* WM_HINTS.initial_state (Normal/Iconic) */
 	uint16_t     unmap_pending; /* WM 起因の UnmapNotify を無視する数 (§3.8) */
 
 	xcb_window_t transient_for;
@@ -210,9 +211,16 @@ struct client {
 	uint64_t     sync_sent_ms;
 	enum sync_state sync_state;
 
-	/* アイコン: 16x16 を各 1 枚のみ (§4.4.1) */
+	/*
+	 * アイコン (§4.4.1)。所有者が違うので必ず分けて持つこと。
+	 *   icon_pix/icon_mask     : WM が作った 16x16。FreePixmap する
+	 *   wmh_icon_pix/_mask     : WM_HINTS 由来のクライアント所有 ID。
+	 *                            絶対に解放しない（他プロセスの資源）
+	 */
 	xcb_pixmap_t icon_pix;
 	xcb_pixmap_t icon_mask;
+	xcb_pixmap_t wmh_icon_pix;
+	xcb_pixmap_t wmh_icon_mask;
 
 	/* タイトルと計測キャッシュ (§2.3.1, §4.5.2.1) */
 	char         title[WM_TITLE_MAX];
@@ -323,6 +331,7 @@ struct wm {
 	uint8_t           shape_base;
 	bool              have_shape;
 
+	xcb_timestamp_t   last_time;   /* 直近に受けたイベントの時刻 (ICCCM 用) */
 	bool              running;
 	bool              restart;
 	int               sig_pipe[2];
@@ -397,6 +406,14 @@ void client_close(struct client *c);               /* WM_DELETE_WINDOW か KillC
 void client_update_frame_extents(struct client *c);
 bool client_decides_decoration(struct client *c);  /* 装飾の有無を再判定 (§3.2) */
 
+/*
+ * 可視矩形 V を返す (SPEC §7.2)。
+ *   SSD: フレームの外形    CSD: ウィンドウ矩形から _GTK_FRAME_EXTENTS を差し引いた矩形
+ * 配置・スナップ・最大化・モニタ帰属判定はすべてこれを基準にする。
+ * 各モジュールで個別に計算すると必ず食い違うため 1 箇所に集約する。
+ */
+void client_visual_rect(const struct client *c, struct rect *out);
+
 /* 装飾の厚み。CSD/undecorated なら 0 を返す */
 void client_frame_offsets(const struct client *c,
                           uint16_t *left, uint16_t *right,
@@ -460,6 +477,12 @@ void move_motion(int16_t root_x, int16_t root_y);
 void move_end(bool cancel);
 bool move_active(void);
 void move_tick(uint64_t now_ms);           /* poll のタイムアウトから呼ぶ */
+/*
+ * ドラッグ中のクライアントが破棄されるときに必ず呼ぶ。
+ * これが無いと client_unmanage → slab_free 後のメモリをドラッグ処理が
+ * 参照し続ける（解放済み領域が読めてしまうため症状が出にくい）。
+ */
+void move_forget(struct client *c);
 int  move_next_timeout_ms(uint64_t now_ms); /* -1 なら待ちなし */
 
 /* ================================================================== *

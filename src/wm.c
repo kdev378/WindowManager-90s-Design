@@ -197,8 +197,13 @@ void client_set_desktop(struct client *c, uint32_t desktop)
 			c->flags |= CF_MAPPED;
 		}
 	} else if (c->flags & CF_MAPPED) {
-		/* WM 起因の Unmap。カウンタで吸収する (§3.8) */
-		c->unmap_pending++;
+		/*
+		 * frame だけを unmap する。子 (c->win) には UnmapNotify が
+		 * 発生しないため、unmap_pending を加算してはならない。
+		 * 加算すると消費されない「貸し」が残り、次に利用者がその
+		 * ウィンドウを閉じたときに本物の UnmapNotify が食われて
+		 * 閉じられなくなる（デスクトップ切替のたびに累積する）。
+		 */
 		xcb_unmap_window(wm.conn, c->frame);
 		c->flags &= ~CF_MAPPED;
 	}
@@ -221,7 +226,7 @@ void desktop_switch(uint32_t desktop)
 			xcb_map_window(wm.conn, c->frame);
 			c->flags |= CF_MAPPED;
 		} else if (!want && (c->flags & CF_MAPPED)) {
-			c->unmap_pending++;      /* (§3.8) */
+			/* frame のみ。client_set_desktop と同じ理由で加算しない */
 			xcb_unmap_window(wm.conn, c->frame);
 			c->flags &= ~CF_MAPPED;
 		}

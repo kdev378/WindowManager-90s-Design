@@ -247,6 +247,39 @@ void client_frame_offsets(const struct client *c,
 	*top  = (uint16_t)(border + caption);
 }
 
+/*
+ * 可視矩形 V (SPEC §7.2)
+ *
+ * SSD なら frame の外形、CSD なら _GTK_FRAME_EXTENTS（影と不可視リサイズ
+ * ボーダー）を差し引いた「利用者に見えている矩形」。
+ * 配置・スナップ・最大化・モニタ帰属判定はすべてこれを基準にする。
+ * 各モジュールが個別に同じ計算を持つと必ず食い違うため、ここに集約する。
+ */
+void client_visual_rect(const struct client *c, struct rect *out)
+{
+	uint16_t l, r, t, b;
+
+	if (c->flags & CF_CSD) {
+		/* GTK は全画面時に extents を 0 に更新するので、その都度読んだ値を使う */
+		int32_t x = c->geom.x + (int32_t)c->gtk_extents[0];
+		int32_t y = c->geom.y + (int32_t)c->gtk_extents[2];
+		int32_t w = (int32_t)c->geom.w - c->gtk_extents[0] - c->gtk_extents[1];
+		int32_t h = (int32_t)c->geom.h - c->gtk_extents[2] - c->gtk_extents[3];
+
+		out->x = (int16_t)x;
+		out->y = (int16_t)y;
+		out->w = (uint16_t)(w > 0 ? w : 1);
+		out->h = (uint16_t)(h > 0 ? h : 1);
+		return;
+	}
+
+	client_frame_offsets(c, &l, &r, &t, &b);
+	out->x = (int16_t)(c->geom.x - l);
+	out->y = (int16_t)(c->geom.y - t);
+	out->w = (uint16_t)(c->geom.w + l + r);
+	out->h = (uint16_t)(c->geom.h + t + b);
+}
+
 /* ================================================================== *
  * ジオメトリの反映
  * ================================================================== */
@@ -652,6 +685,13 @@ void client_unmanage(struct client *c, bool destroyed)
 	if (c->flags & CF_DESTROYED)
 		return;
 	c->flags |= CF_DESTROYED;
+
+	/*
+	 * ドラッグ中ならセッションを破棄する。
+	 * これを忘れると slab_free 後の領域をドラッグ処理が参照し続ける
+	 * （解放済みメモリが読めてしまうぶん、症状が出にくい不具合になる）。
+	 */
+	move_forget(c);
 
 	if (!destroyed) {
 		/*

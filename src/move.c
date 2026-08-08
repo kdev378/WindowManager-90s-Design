@@ -680,3 +680,19 @@ void move_end(bool cancel)
 
 	xcb_flush(wm.conn);
 }
+
+/* ------------------------------------------------------------------ *
+ * 破棄されるクライアントをドラッグ対象から外す
+ *
+ * client_unmanage から呼ばれる。slab_free 後の領域を参照し続けると、
+ * 解放済みメモリが読めてしまうぶん症状が出にくい不具合になる。
+ * ------------------------------------------------------------------ */
+void move_forget(struct client *c)
+{
+	if (drag.kind == DRAG_NONE || drag.c != c)
+		return;
+	xcb_ungrab_pointer(wm.conn, XCB_CURRENT_TIME);
+	drag.kind = DRAG_NONE;
+	drag.c = NULL;
+	drag.has_pending = false;
+}
