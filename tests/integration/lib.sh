@@ -1,0 +1,144 @@
+#!/bin/sh
+#
+# lib.sh - 結合テスト共通ヘルパ
+#
+# 各 tests/integration/*.sh の先頭で以下のように読み込んで使う:
+#   . "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/lib.sh"
+#
+# 設計方針:
+#   各テストスクリプトは「自分専用の」フレッシュな Xvfb + WM インスタンスを
+#   起動する (start_xvfb / start_wm)。テスト間で Xvfb・WM を共有しない。
+#   これは 040-saveset.sh が WM プロセス自体を kill -9 で落とすテストであり、
+#   共有した場合は後続のテストが巻き添えで失敗するため。
+#   tests/run-tests.sh 側は各スクリプトを個別プロセスとして実行するだけで、
+#   Xvfb/WM のライフサイクル管理はしない。
+#
+# 必要なツールが無い場合は skip (終了コード 77) で降りる。
+# w98wm バイナリが無い場合も同様に skip する (他エージェントがまだ
+# src/ を実装中でビルドが終わっていない可能性があるため、fail 扱いにはしない)。
+#
+# POSIX sh 前提 (dash で動作確認)。
+
+skip() {
+	echo "SKIP: $*"
+	exit 77
+}
+
+fail() {
+	echo "FAIL: $*" >&2
+	exit 1
+}
+
+require_tool() {
+	command -v "$1" >/dev/null 2>&1 || skip "必要なツールがありません: $1"
+}
+
+require_tool xdotool
+require_tool xprop
+require_tool Xvfb
+
+WM_BIN="${W98WM_BIN:-$(pwd)/w98wm}"
+if [ ! -x "$WM_BIN" ]; then
+	skip "w98wm バイナリが見つかりません ($WM_BIN)。ビルドされていないようです。"
+fi
+
+_LIB_PIDS=""
+_lib_cleanup() {
+	for p in $_LIB_PIDS; do
+		kill "$p" 2>/dev/null || true
+	done
+	wait 2>/dev/null || true
+}
+trap _lib_cleanup EXIT INT TERM
+
+find_free_display() {
+	d=99
+	while [ -e "/tmp/.X${d}-lock" ]; do
+		d=$((d + 1))
+	done
+	echo "$d"
+}
+
+# start_xvfb: フレッシュな Xvfb を起動し、DISPLAY を export する。
+start_xvfb() {
+	disp=$(find_free_display)
+	Xvfb ":$disp" -screen 0 1280x1024x24 -nolisten tcp >/tmp/w98wm-test-xvfb-$$.log 2>&1 &
+	XVFB_PID=$!
+	_LIB_PIDS="$_LIB_PIDS $XVFB_PID"
+	i=0
+	while [ ! -e "/tmp/.X${disp}-lock" ] && [ $i -lt 50 ]; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	[ -e "/tmp/.X${disp}-lock" ] || fail "Xvfb の起動に失敗しました"
+	DISPLAY=":$disp"
+	export DISPLAY
+}
+
+# start_wm: $WM_BIN を起動し WM_PID を設定する。
+# _NET_SUPPORTING_WM_CHECK が現れるまで最大 6 秒待つが、現れなくても
+# (未実装の可能性があるため) fail にはせず先へ進める。以降の実際の
+# アサーションで自然に失敗させる方針。
+start_wm() {
+	WM_PID_LOG="/tmp/w98wm-test-wm-$$.log"
+	DISPLAY="$DISPLAY" "$WM_BIN" >"$WM_PID_LOG" 2>&1 &
+	WM_PID=$!
+	_LIB_PIDS="$_LIB_PIDS $WM_PID"
+	i=0
+	while [ $i -lt 30 ]; do
+		if ! kill -0 "$WM_PID" 2>/dev/null; then
+			fail "WM が起動直後に終了しました (ログ: $WM_PID_LOG)"
+		fi
+		if xprop -display "$DISPLAY" -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1; then
+			return 0
+		fi
+		sleep 0.2
+		i=$((i + 1))
+	done
+	# ここに来るのは _NET_SUPPORTING_WM_CHECK がまだ実装されていない場合。
+	# WM プロセス自体は生きているので、そのままテスト本体に進む。
+	return 0
+}
+
+# wait_for_window <xdotool searchのキー> <値> [タイムアウト秒(既定5)]
+# 見つかったウィンドウID (10進) を標準出力に書いて成功、見つからなければ失敗を返す。
+wait_for_window() {
+	key="$1"
+	val="$2"
+	tmo="${3:-5}"
+	max=$((tmo * 5))
+	i=0
+	while [ $i -lt $max ]; do
+		win=$(xdotool search "$key" "$val" 2>/dev/null | head -n1)
+		if [ -n "$win" ]; then
+			echo "$win"
+			return 0
+		fi
+		sleep 0.2
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# get_root_window: ルートウィンドウID (16進, 0x...) を返す。xwininfo が無ければ空文字。
+get_root_window() {
+	command -v xwininfo >/dev/null 2>&1 || {
+		echo ""
+		return 1
+	}
+	xwininfo -display "$DISPLAY" -root 2>/dev/null | awk '/Window id:/ { print $4; exit }'
+}
+
+# get_parent_window <ウィンドウID> : 親ウィンドウID (16進) を返す。xwininfo が無ければ空文字。
+get_parent_window() {
+	command -v xwininfo >/dev/null 2>&1 || {
+		echo ""
+		return 1
+	}
+	xwininfo -display "$DISPLAY" -id "$1" 2>/dev/null | awk '/Parent window id:/ { print $4; exit }'
+}
+
+# hex表示 <10進のウィンドウID> : xdotool の10進出力を xprop/wmctrl 用の0x...表記に変換する
+to_hex() {
+	printf '0x%x\n' "$1"
+}

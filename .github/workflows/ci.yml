@@ -1,0 +1,113 @@
+# CI - w98wm
+#
+# 対応: docs/PLAN.md Phase 0
+#   - build-glibc: Ubuntu 上で gcc / clang の両方でビルドし、
+#     brand.h の一元性チェック・_NET_SUPPORTED のテスト網羅チェック・
+#     結合テスト (Xvfb)・メモリ計測 (SPEC §9.1) を行う。
+#   - build-musl: Alpine コンテナ内でビルドする (Alpine のネイティブ libc が musl)。
+#     PLAN.md の指摘の通り、Ubuntu 上の musl-gcc では musl 向けにビルドされた
+#     libxcb 一式が存在しないため、Ubuntu 上でのクロスビルドは行わない。
+#
+# OpenBSD について: CI にランナーが存在しないため、ジョブは追加しない。
+#   構文検査・手動検証手順は docs/PLAN.md Phase 5 を参照 (このリポジトリの
+#   スコープでは自動化しない、という PLAN 記載の方針に従う)。
+#
+# 注記 (Alpine パッケージ名について): xcb-util-keysyms-dev 等のパッケージ名は
+# Alpine のバージョンにより変わることがある。apk add が失敗する場合は
+# https://pkgs.alpinelinux.org/ で正しい名称を確認して更新すること。
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # M20h (1時間 + 500サイクル) は毎コミットではなく nightly で実行する (SPEC §9.3)。
+    - cron: '0 3 * * *'
+
+jobs:
+  build-glibc:
+    name: build-glibc (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 依存パッケージのインストール (Ubuntu / glibc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxcb1-dev libxcb-randr0-dev libxcb-sync-dev \
+            libxcb-keysyms1-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            xvfb xterm xdotool wmctrl x11-utils \
+            valgrind \
+            xfonts-base xbitmaps
+
+      - name: ビルド (${{ matrix.cc }}, core プロファイル)
+        run: make CC=${{ matrix.cc }}
+
+      - name: brand.h の一元性チェック (SPEC §11.1)
+        run: make check-brand
+
+      - name: _NET_SUPPORTED のテスト網羅チェック (SPEC §5.2.1)
+        run: |
+          if grep -qE '^check-supported:' Makefile; then
+            make check-supported
+          else
+            sh tools/check-supported.sh
+          fi
+
+      - name: 結合テスト
+        run: |
+          if command -v xvfb-run >/dev/null 2>&1; then
+            xvfb-run -a sh tests/run-tests.sh
+          else
+            sh tests/run-tests.sh
+          fi
+
+      - name: "メモリ計測 (SPEC §9.1: M0/M1/M20)"
+        run: sh tools/memcheck.sh
+
+      - name: "メモリ計測 --long (nightly のみ / SPEC §9.3: M20h)"
+        if: github.event_name == 'schedule'
+        run: sh tools/memcheck.sh --long --json
+
+  build-musl:
+    name: build-musl (Alpine)
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 依存パッケージのインストール (Alpine / musl)
+        run: |
+          apk update
+          apk add --no-cache \
+            build-base pkgconf \
+            libxcb-dev xcb-util-keysyms-dev \
+            xvfb xterm xdotool wmctrl \
+            valgrind \
+            font-misc-misc
+
+      - name: ビルド (Alpine ネイティブ = musl)
+        run: make
+
+      - name: brand.h の一元性チェック (SPEC §11.1)
+        run: make check-brand
+
+      - name: _NET_SUPPORTED のテスト網羅チェック (SPEC §5.2.1)
+        run: |
+          if grep -qE '^check-supported:' Makefile; then
+            make check-supported
+          else
+            sh tools/check-supported.sh
+          fi
+
+      - name: 結合テスト
+        run: sh tests/run-tests.sh

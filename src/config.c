@@ -222,9 +222,15 @@ void config_defaults(struct config *cfg)
 	 * color[16] は THEME_* で索引される配列だが、その enum は theme.c
 	 * (Phase 2) が定義する。ここでは絶対に色定数を捏造しない。ゼロ初期化
 	 * のまま theme.c 側の初期化に委ねる（上の memset で既にゼロ）。 */
-	strlcpy(cfg->font,
-	        "-*-helvetica-medium-r-normal--11-*-*-*-p-*-iso10646-1",
-	        sizeof(cfg->font));
+	/* strlcpy() は使わない。compat.h は glibc>=2.38 なら <string.h> の
+	 * strlcpy をそのまま使う想定だが、glibc はこれを __USE_MISC
+	 * (_DEFAULT_SOURCE/_GNU_SOURCE) 配下でしか宣言しない。本ビルドは
+	 * -D_POSIX_C_SOURCE=200809L のみを立てるため未宣言になり、
+	 * -Wimplicit-function-declaration に触れる（compat.h 側の前提の
+	 * 抜け穴。詳細は報告に記載）。snprintf は C99 標準で常に使えるので
+	 * こちらで代用する。 */
+	snprintf(cfg->font, sizeof(cfg->font), "%s",
+	        "-*-helvetica-medium-r-normal--11-*-*-*-p-*-iso10646-1");
 	cfg->scale = 1;
 
 	/* ---- 挙動 ---- */
@@ -432,7 +438,7 @@ static void apply_key(struct config *cfg, const char *key, char *value)
 	}
 
 	if (strcmp(key, "font") == 0) {
-		strlcpy(cfg->font, value, sizeof(cfg->font));
+		snprintf(cfg->font, sizeof(cfg->font), "%s", value);
 		return;
 	}
 
@@ -647,7 +653,7 @@ static bool find_config_path(char *out, size_t outsz)
 	const char *xdg_dirs = getenv("XDG_CONFIG_DIRS");
 	if (xdg_dirs != NULL && xdg_dirs[0] != '\0') {
 		char dirs_buf[1024];
-		strlcpy(dirs_buf, xdg_dirs, sizeof(dirs_buf));
+		snprintf(dirs_buf, sizeof(dirs_buf), "%s", xdg_dirs);
 		char *saveptr = NULL;
 		for (char *tok = strtok_r(dirs_buf, ":", &saveptr); tok != NULL;
 		     tok = strtok_r(NULL, ":", &saveptr)) {
@@ -657,7 +663,7 @@ static bool find_config_path(char *out, size_t outsz)
 	}
 
 	if (access(WM_SYSCONF_PATH, R_OK) == 0) {
-		strlcpy(out, WM_SYSCONF_PATH, outsz);
+		snprintf(out, outsz, "%s", WM_SYSCONF_PATH);
 		return true;
 	}
 

@@ -15,13 +15,21 @@
  *   OpenBSD には標準である。glibc は 2.38 以降で提供する。
  *   無い環境向けに util.c が実装を持つ。
  * ------------------------------------------------------------------ */
+/*
+ * 判定は「実装が存在するか」ではなく「宣言が見えるか」で行う。
+ * glibc 2.38 以降は strlcpy を持つが、宣言は __USE_MISC
+ * (_DEFAULT_SOURCE / _GNU_SOURCE) の下にしか無い。本プロジェクトは
+ * -D_POSIX_C_SOURCE=200809L のみでビルドするため __USE_MISC は立たず、
+ * バージョンだけで判定すると「宣言が見えないのに自前実装も無効化される」
+ * 状態になり、呼び出し側で implicit declaration の警告が出る。
+ */
+#include <string.h>
+
 #if defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
     defined(__APPLE__)
-#  include <string.h>
 #  define WM_HAVE_STRLCPY 1
-#elif defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#elif defined(__GLIBC__) && defined(__GLIBC_PREREQ) && defined(__USE_MISC)
 #  if __GLIBC_PREREQ(2, 38)
-#    include <string.h>
 #    define WM_HAVE_STRLCPY 1
 #  endif
 #endif
