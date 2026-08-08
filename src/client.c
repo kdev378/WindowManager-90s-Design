@@ -27,10 +27,6 @@
  * 数値を他所へ直書きしないこと（移設時に取りこぼす）。
  * ================================================================== */
 
-#define FRAME_BORDER_SIZING   4   /* サイジングボーダー幅 (§4.2) */
-#define FRAME_BORDER_FIXED    3   /* リサイズ不可窓の固定ボーダー幅 (§4.2) */
-#define FRAME_CAPTION_H      18   /* タイトルバー高（描画領域） (§4.2) */
-#define FRAME_CAPTION_H_SMALL 13  /* ツールウィンドウのタイトル高 (§4.2) */
 
 /* ================================================================== *
  * ICCCM §4.1.3.1 の WM_STATE 値
@@ -225,7 +221,8 @@ void client_frame_offsets(const struct client *c,
                           uint16_t *left, uint16_t *right,
                           uint16_t *top, uint16_t *bottom)
 {
-	uint16_t border, caption, scale;
+	uint16_t border, caption;
+	const struct metrics *m;
 
 	/* 装飾なし（undecorated / CSD / 全画面）は全辺 0。
 	 * frame は作るがボーダーとキャプションを 0 にする、という §3.2 / §7.2 の規定。 */
@@ -234,15 +231,16 @@ void client_frame_offsets(const struct client *c,
 		return;
 	}
 
-	scale = wm.cfg.scale != 0 ? wm.cfg.scale : 1;   /* 整数倍のみ (§4.2) */
+	/*
+	 * メトリクスは theme_metrics() から取る。生の定数をここに持つと
+	 * deco.c と二重定義になり、scale の扱いが片方だけ変わった瞬間に
+	 * 「描画位置と当たり判定がずれる」形で壊れる。値は既に scale 倍済み。
+	 */
+	m = theme_metrics();
 
-	border = (c->flags & CF_FIXED_SIZE) ? FRAME_BORDER_FIXED
-	                                    : FRAME_BORDER_SIZING;
-	caption = type_props(c->type)->small_caption ? FRAME_CAPTION_H_SMALL
-	                                             : FRAME_CAPTION_H;
-
-	border  = (uint16_t)(border * scale);
-	caption = (uint16_t)(caption * scale);
+	border  = (c->flags & CF_FIXED_SIZE) ? m->border_fixed : m->border_sizing;
+	caption = type_props(c->type)->small_caption ? m->caption_h_small
+	                                             : m->caption_h;
 
 	*left = *right = *bottom = border;
 	*top  = (uint16_t)(border + caption);
