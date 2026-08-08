@@ -580,6 +580,9 @@ struct client *client_manage(xcb_window_t win, bool adopting)
 	icccm_update_window_type(c);
 	icccm_update_states(c);
 	icccm_update_gtk_extents(c);   /* CF_CSD はここで立つ (§7.2) */
+	motif_update(c);               /* _MOTIF_WM_HINTS (§3.2) */
+	icon_update(c);                /* _NET_WM_ICON (§4.4.1) */
+	sync_client_init(c);           /* _NET_WM_SYNC_REQUEST (§7.3) */
 
 	update_fixed_size(c);
 
@@ -587,6 +590,8 @@ struct client *client_manage(xcb_window_t win, bool adopting)
 		c->flags |= CF_DECORATED;
 	else
 		c->flags &= ~(uint32_t)CF_DECORATED;
+
+	shape_apply(c);                /* 非矩形ウィンドウの形状追従 (§5.3、任意) */
 
 	/* デスクトップの決定 (§3.8) */
 	if (prop_get_card32(c->win, atoms[ATOM_NET_WM_DESKTOP],
@@ -744,21 +749,14 @@ void client_unmanage(struct client *c, bool destroyed)
 	 * （サーバ側リソースが線形）を静かに破る。通常操作では表面化しない。
 	 * カウンタ側が先に消えていると BadAlarm になるが、§2.2.2 に従い無視でよい。
 	 */
-	if (c->sync_alarm != 0) {
-		xcb_sync_destroy_alarm(wm.conn, c->sync_alarm);
-		c->sync_alarm = 0;
-	}
+	sync_client_fini(c);
 
-	/* アイコンの Pixmap を解放する (§4.4.1)。破棄済みウィンドウでも
-	 * Pixmap は w98wm 自身が作ったリソースなので有効。 */
-	if (c->icon_pix != XCB_PIXMAP_NONE) {
-		xcb_free_pixmap(wm.conn, c->icon_pix);
-		c->icon_pix = XCB_PIXMAP_NONE;
-	}
-	if (c->icon_mask != XCB_PIXMAP_NONE) {
-		xcb_free_pixmap(wm.conn, c->icon_mask);
-		c->icon_mask = XCB_PIXMAP_NONE;
-	}
+	/*
+	 * アイコンの解放 (§4.4.1)。所有者の区別は icon.c が持つ——
+	 * WM が作った Pixmap は解放し、WM_HINTS 由来のクライアント所有 ID は
+	 * 絶対に解放しない（他プロセスの資源を壊すため）。
+	 */
+	icon_free(c);
 
 	/* リストから外してからフォーカスを渡す。
 	 * 先に外すのは、focus_next_after() が候補走査でこの client を拾わないため。 */

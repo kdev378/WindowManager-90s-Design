@@ -220,9 +220,17 @@ static void on_property_notify(xcb_property_notify_event_t *e)
 		client_decides_decoration(c);
 		stack_apply();
 	} else if (e->atom == atoms[ATOM_GTK_FRAME_EXTENTS]) {
-		icccm_update_gtk_extents(c);
+		csd_state_changed(c);          /* §7.2 遷移のたびに読み直す */
+	} else if (e->atom == atoms[ATOM_MOTIF_WM_HINTS]) {
+		motif_update(c);
 		client_decides_decoration(c);
 		client_apply_geometry(c);
+		deco_invalidate(c);
+	} else if (e->atom == atoms[ATOM_NET_WM_ICON]) {
+		icon_update(c);                /* §4.4.1 */
+		deco_invalidate(c);
+	} else if (e->atom == atoms[ATOM_NET_WM_SYNC_REQUEST_COUNTER]) {
+		sync_property_changed(c);      /* §7.3 カウンタ差し替え */
 	} else if (e->atom == atoms[ATOM_NET_WM_STRUT] ||
 	           e->atom == atoms[ATOM_NET_WM_STRUT_PARTIAL]) {
 		layout_update_workareas();
@@ -504,6 +512,12 @@ void event_dispatch(xcb_generic_event_t *ev)
 	if (menu_active() && menu_handle_event(ev))
 		return;
 
+	/* XSync のアラーム (SPEC §7.3) と Shape (§5.3) */
+	if (sync_handle_event(ev))
+		return;
+	if (shape_handle_event(ev))
+		return;
+
 	/* RandR (SPEC §5.3) */
 	if (wm.have_randr &&
 	    type == wm.randr_base + XCB_RANDR_SCREEN_CHANGE_NOTIFY) {
@@ -528,9 +542,16 @@ void event_dispatch(xcb_generic_event_t *ev)
 	case XCB_PROPERTY_NOTIFY:
 		on_property_notify((xcb_property_notify_event_t *)ev);
 		break;
-	case XCB_CLIENT_MESSAGE:
-		ewmh_handle_client_message((xcb_client_message_event_t *)ev);
+	case XCB_CLIENT_MESSAGE: {
+		xcb_client_message_event_t *cm = (xcb_client_message_event_t *)ev;
+		/* 順序: ping の応答 → 起動通知 → EWMH 一般 */
+		if (ping_handle_reply(cm))
+			break;
+		if (startup_handle_message(cm))
+			break;
+		ewmh_handle_client_message(cm);
 		break;
+	}
 	case XCB_BUTTON_PRESS:
 		on_button_press((xcb_button_press_event_t *)ev);
 		break;

@@ -15,7 +15,8 @@ CFLAGS_WARN= -Wall -Wextra -Wpedantic -Wno-unused-parameter \
              -Wshadow -Wstrict-prototypes -Wmissing-prototypes
 LDFLAGS_GC = -Wl,--gc-sections
 
-REQ_PKGS   = xcb xcb-randr xcb-sync xcb-keysyms
+# xcb-shape は任意 (SPEC §5.3)。無ければ shape.c が実行時に縮退する。
+REQ_PKGS   = xcb xcb-randr xcb-sync xcb-keysyms xcb-shape
 PKG_CFLAGS != $(PKG_CONFIG) --cflags $(REQ_PKGS) 2>/dev/null
 PKG_LIBS   != $(PKG_CONFIG) --libs   $(REQ_PKGS) 2>/dev/null
 
@@ -27,7 +28,8 @@ LIBS    = $(PKG_LIBS)
 OBJS = src/main.o src/wm.o src/event.o src/client.o src/icccm.o \
        src/ewmh.o src/atoms.o src/stack.o src/focus.o src/move.o \
        src/layout.o src/input.o src/config.o src/util.o src/type.o \
-       src/theme.o src/draw.o src/font.o src/deco.o src/cursor.o src/menu.o
+       src/theme.o src/draw.o src/font.o src/deco.o src/cursor.o src/menu.o \
+       src/sync.o src/motif.o src/icon.o src/ping.o src/shape.o
 
 BIN = w98wm
 

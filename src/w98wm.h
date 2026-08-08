@@ -231,6 +231,16 @@ struct client {
 	uint16_t     caption_w_at_measure;
 
 	uint32_t     user_time;   /* _NET_WM_USER_TIME (§3.6) */
+	xcb_window_t user_time_win;/* _NET_WM_USER_TIME_WINDOW */
+
+	/* _NET_WM_PING (§7.4) */
+	uint64_t     ping_sent_ms;   /* 0 = 送信中でない */
+	uint32_t     ping_serial;
+	bool         unresponsive;   /* タイトルに (応答なし) を付ける */
+
+	/* _MOTIF_WM_HINTS (§3.2)。読み取り結果をキャッシュする */
+	bool         motif_seen;
+	bool         motif_no_deco;
 
 	/* 装飾の対話状態 (§4.4)。ボタンのホバー/押下 */
 	uint8_t      hover_part;  /* enum frame_part */
@@ -514,6 +524,60 @@ void input_run_action(uint8_t action, const char *arg, struct client *c);
 void spawn_command(const char *cmd);       /* posix_spawn (§2.2.1) */
 
 /* ================================================================== *
+ * sync.c — _NET_WM_SYNC_REQUEST (SPEC §7.3)
+ *
+ * 基本プロトコル（カウンタ 1 個）のみ実装する。値は単調増加する
+ * リクエスト ID であり、偶奇に意味は無い（偶奇はカウンタ 2 個の
+ * 拡張プロトコルのもので別物）。
+ * ================================================================== */
+
+void sync_client_init(struct client *c);   /* カウンタ検出とアラーム作成 */
+void sync_client_fini(struct client *c);   /* DestroyAlarm。忘れるとサーバ側が漏れる */
+void sync_property_changed(struct client *c);  /* カウンタ差し替えに追従 */
+
+/*
+ * リサイズ 1 コマの開始。target を採番し ChangeAlarm で trigger を
+ * 更新してからクライアントメッセージを送る。
+ * **ChangeAlarm を忘れると初回しか発火しない**（POSITIVE_COMPARISON は
+ * 「カウンタ >= trigger」で発火するため）。
+ * 戻り値: 同期を使うなら true（呼び出し側は SYNC_WAITING に入る）
+ */
+bool sync_request(struct client *c);
+/* XSyncAlarmNotify の処理。処理したら true */
+bool sync_handle_event(xcb_generic_event_t *ev);
+/* 250ms 経過の判定。STALLED へ落として CF_SYNC_UNFIT を立てる */
+void sync_check_timeout(uint64_t now_ms);
+
+/* ================================================================== *
+ * ping.c — _NET_WM_PING と起動通知 (SPEC §7.4)
+ * ================================================================== */
+
+void ping_client(struct client *c);           /* 応答確認を送る */
+bool ping_handle_reply(xcb_client_message_event_t *ev);
+void ping_check_timeout(uint64_t now_ms);     /* 無応答の判定 */
+
+/* 起動通知: ルート宛の _NET_STARTUP_INFO(_BEGIN) メッセージ列を組み立てる */
+bool startup_handle_message(xcb_client_message_event_t *ev);
+void startup_check_timeout(uint64_t now_ms);
+void startup_window_mapped(struct client *c);
+
+/* ================================================================== *
+ * icon.c — _NET_WM_ICON と WM_HINTS のアイコン (SPEC §4.4.1)
+ * ================================================================== */
+
+/*
+ * アイコンを読み込み 16x16 の Pixmap を作る。
+ *  - プロパティは long_offset/long_length で分割して読む
+ *    （256x256 の 1 枚だけで 256KB あり、丸ごと読むとピーク使用量を破る）
+ *  - 一辺 256 超のエントリは除外。全長 4MB 超はアイコン無し
+ *  - 差し替えレースを全長の突き合わせで検出し 2 回までリトライ
+ *  - 保持は 1 クライアントあたり Pixmap 1 枚 + マスク 1 枚のみ。
+ *    差し替え時は新しい方を作ってから古い方を即座に FreePixmap
+ */
+void icon_update(struct client *c);
+void icon_free(struct client *c);
+
+/* ================================================================== *
  * deco.c — フレームの描画と当たり判定 (SPEC §4.3, §4.4, §4.6)
  * ================================================================== */
 
@@ -579,6 +643,34 @@ void ewmh_set_wm_state(struct client *c);
 void ewmh_set_allowed_actions(struct client *c);
 void ewmh_set_frame_extents(struct client *c);
 bool ewmh_handle_client_message(xcb_client_message_event_t *ev);
+
+/*
+ * フォーカススティール防止 (SPEC §3.6)
+ * アプリ由来の _NET_ACTIVE_WINDOW 要求が、直近の利用者操作より古い
+ * _NET_WM_USER_TIME を持つ場合は、アクティブ化せず
+ * _NET_WM_STATE_DEMANDS_ATTENTION に落とす。
+ * pager 由来 (source==2) は常に許可する。
+ */
+bool ewmh_allow_activation(struct client *c, uint32_t source, xcb_timestamp_t t);
+void ewmh_set_demands_attention(struct client *c, bool on);
+void ewmh_update_showing_desktop(void);
+
+/* ================================================================== *
+ * motif.c — _MOTIF_WM_HINTS と CSD (SPEC §3.2, §7.2)
+ * ================================================================== */
+
+void motif_update(struct client *c);       /* _MOTIF_WM_HINTS を読む */
+/* CSD の状態遷移で _GTK_FRAME_EXTENTS を読み直す (§7.2)。
+ * GTK は全画面時に extents を 0 に更新するため、遷移のたびに再取得が要る */
+void csd_state_changed(struct client *c);
+
+/* ================================================================== *
+ * shape.c — 非矩形ウィンドウ (SPEC §5.3、任意)
+ * ================================================================== */
+
+void shape_init(void);
+void shape_apply(struct client *c);        /* クライアントの形状をフレームへ反映 */
+bool shape_handle_event(xcb_generic_event_t *ev);
 
 /* ================================================================== *
  * 小さなヘルパ（プロパティ読み取り）

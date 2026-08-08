@@ -112,6 +112,12 @@ static void event_loop(void)
 
 		now = wm_now_ms();
 		timeout = move_next_timeout_ms(now);
+		/*
+		 * ping と起動通知のタイムアウトは秒単位なので、move の
+		 * ミリ秒精度の要求より粗い。待ちなし(-1)の時だけ 1 秒で起こす。
+		 */
+		if (timeout < 0)
+			timeout = 1000;
 
 		ret = poll(pfd, 2, timeout);
 		if (ret < 0 && errno != EINTR) {
@@ -147,7 +153,13 @@ static void event_loop(void)
 			break;
 		}
 
-		move_tick(wm_now_ms());
+		{
+			uint64_t t = wm_now_ms();
+			move_tick(t);
+			sync_check_timeout(t);     /* §7.3 250ms */
+			ping_check_timeout(t);     /* §7.4 5s */
+			startup_check_timeout(t);  /* §7.4 15s */
+		}
 	}
 }
 
