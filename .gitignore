@@ -1,0 +1,13 @@
+# ビルド生成物
+*.o
+*.a
+/w98wm
+tests/unit/unit_tests
+
+# エディタ・OS
+*.swp
+*~
+.DS_Store
+
+# 計測の生ログ（docs/MEMORY.md に集約したものだけをコミットする）
+/memcheck-*.json
