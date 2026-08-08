@@ -166,6 +166,82 @@ void wm_scan_existing(void)
 }
 
 /* ------------------------------------------------------------------ *
+ * 仮想デスクトップ (SPEC §3.8)
+ *
+ * 切替は frame の map/unmap で行う（座標退避方式は
+ * _NET_MOVERESIZE_WINDOW で動かされたときに破綻するため採らない）。
+ * 非表示面のウィンドウは WM_STATE=Normal のまま、_NET_WM_STATE_HIDDEN は
+ * 立てない——最小化(Iconic)と「別の面にある」は別の状態であり、
+ * タスクバーとタスクスイッチャはこれを区別して表示する。
+ * ------------------------------------------------------------------ */
+bool client_visible_on(const struct client *c, uint32_t desktop)
+{
+	if (c->flags & CF_ICONIC)
+		return false;
+	if ((c->states & ST_STICKY) || c->desktop == WM_ALL_DESKTOPS)
+		return true;
+	return c->desktop == desktop;
+}
+
+void client_set_desktop(struct client *c, uint32_t desktop)
+{
+	uint32_t v = desktop;
+
+	c->desktop = desktop;
+	xcb_change_property(wm.conn, XCB_PROP_MODE_REPLACE, c->win,
+		atoms[ATOM_NET_WM_DESKTOP], XCB_ATOM_CARDINAL, 32, 1, &v);
+
+	if (client_visible_on(c, wm.current_desktop)) {
+		if (!(c->flags & CF_MAPPED)) {
+			xcb_map_window(wm.conn, c->frame);
+			c->flags |= CF_MAPPED;
+		}
+	} else if (c->flags & CF_MAPPED) {
+		/* WM 起因の Unmap。カウンタで吸収する (§3.8) */
+		c->unmap_pending++;
+		xcb_unmap_window(wm.conn, c->frame);
+		c->flags &= ~CF_MAPPED;
+	}
+}
+
+void desktop_switch(uint32_t desktop)
+{
+	struct client *c;
+	uint32_t v;
+
+	if (desktop >= wm.n_desktops || desktop == wm.current_desktop)
+		return;
+
+	wm.current_desktop = desktop;
+
+	for (c = wm.stack_bottom; c; c = c->next) {
+		bool want = client_visible_on(c, desktop);
+
+		if (want && !(c->flags & CF_MAPPED)) {
+			xcb_map_window(wm.conn, c->frame);
+			c->flags |= CF_MAPPED;
+		} else if (!want && (c->flags & CF_MAPPED)) {
+			c->unmap_pending++;      /* (§3.8) */
+			xcb_unmap_window(wm.conn, c->frame);
+			c->flags &= ~CF_MAPPED;
+		}
+	}
+
+	v = desktop;
+	xcb_change_property(wm.conn, XCB_PROP_MODE_REPLACE, wm.root,
+		atoms[ATOM_NET_CURRENT_DESKTOP], XCB_ATOM_CARDINAL, 32, 1, &v);
+
+	stack_apply();
+
+	/* 切替先の MRU 先頭へフォーカスを移す。無ければ受け皿へ (§3.6) */
+	c = focus_mru_first(desktop);
+	if (c)
+		focus_set(c, XCB_CURRENT_TIME);
+	else
+		focus_none();
+}
+
+/* ------------------------------------------------------------------ *
  * 初期化
  * ------------------------------------------------------------------ */
 static bool take_root(void)

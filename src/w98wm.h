@@ -369,6 +369,16 @@ void wm_shutdown(void);
 void wm_scan_existing(void);       /* 起動時の adopt (Phase 1-2) */
 bool wm_acquire_selection(bool replace);
 
+/*
+ * デスクトップ切替 (SPEC §3.8)
+ * 切替は frame の map/unmap で行う。非表示面のウィンドウは WM_STATE=Normal の
+ * まま保ち、_NET_WM_STATE_HIDDEN は立てない（最小化と区別するため）。
+ * WM 起因の UnmapNotify は client->unmap_pending で吸収する。
+ */
+void desktop_switch(uint32_t desktop);
+void client_set_desktop(struct client *c, uint32_t desktop);
+bool client_visible_on(const struct client *c, uint32_t desktop);
+
 /* ================================================================== *
  * client.c — クライアントのライフサイクル (SPEC §3.1, §3.1.0, §3.1.1)
  * ================================================================== */
