@@ -99,7 +99,10 @@ XVFB_PID=""
 WM_PID=""
 XTERM_PIDS=""
 
+_CLEANED_UP=0
 cleanup() {
+	[ "$_CLEANED_UP" -eq 1 ] && return 0
+	_CLEANED_UP=1
 	for p in $XTERM_PIDS; do
 		kill "$p" 2>/dev/null || true
 	done
@@ -163,6 +166,12 @@ stop_wm() {
 		kill "$WM_PID" 2>/dev/null || true
 		wait "$WM_PID" 2>/dev/null || true
 		WM_PID=""
+		# 同じ Xvfb 上で次の WM をすぐ起動すると、マネージャセレクション
+		# (WM_S0) の解放が X サーバ側でまだ反映しきっていないタイミングと
+		# 競合し、次の起動が「既に WM が居る」と判断して即終了することが
+		# 稀にある (SPEC §5.1 の §4.3, --replace 無し時のエラー処理)。
+		# 実測で確認された揺らぎのため、小さな猶予を置く。
+		sleep 0.3
 	fi
 }
 

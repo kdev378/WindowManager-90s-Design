@@ -56,7 +56,12 @@ if [ ! -x "$BIN" ]; then
 fi
 
 PIDS=""
+_CLEANED_UP=0
 cleanup() {
+	# EXIT と INT/TERM の両方に trap を張っているため、シグナル受信後に
+	# 自然に EXIT へ抜けると二重に走る。ガード変数で1回だけにする。
+	[ "$_CLEANED_UP" -eq 1 ] && return 0
+	_CLEANED_UP=1
 	echo ""
 	echo "終了処理中..."
 	for p in $PIDS; do

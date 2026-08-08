@@ -89,6 +89,20 @@ static void on_map_request(xcb_map_request_event_t *e)
 		}
 	}
 	client_deiconify(c);
+
+	/*
+	 * 新しく開いたウィンドウをアクティブにする。
+	 * click-to-focus でも「今開いたウィンドウは能動化する」のが
+	 * 通常の挙動であり、これが無いと _NET_ACTIVE_WINDOW が None のままで
+	 * キーボード入力の行き先が無い。
+	 * フォーカスを取れない種別 (DOCK/SPLASH/ポップアップ類, §5.2.2) は除く。
+	 * 起動時の adopt 経路はここを通らない。
+	 *
+	 * TODO(Phase 3): _NET_WM_USER_TIME によるフォーカススティール防止 (§3.6)。
+	 *   古い user_time を持つ自己アクティブ化は DEMANDS_ATTENTION に落とす。
+	 */
+	if (type_props(c->type)->focusable && !(c->flags & CF_ICONIC))
+		focus_set(c, wm.last_time);
 }
 
 static void on_configure_request(xcb_configure_request_event_t *e)
@@ -270,6 +284,23 @@ static void on_enter_notify(xcb_enter_notify_event_t *e)
 void event_dispatch(xcb_generic_event_t *ev)
 {
 	uint8_t type = ev->response_type & 0x7f;   /* send_event ビットを落とす */
+
+	/* 直近のイベント時刻を控える。ICCCM は CurrentTime より実時刻を好む */
+	switch (type) {
+	case XCB_KEY_PRESS:
+	case XCB_KEY_RELEASE:
+		wm.last_time = ((xcb_key_press_event_t *)ev)->time; break;
+	case XCB_BUTTON_PRESS:
+	case XCB_BUTTON_RELEASE:
+		wm.last_time = ((xcb_button_press_event_t *)ev)->time; break;
+	case XCB_MOTION_NOTIFY:
+		wm.last_time = ((xcb_motion_notify_event_t *)ev)->time; break;
+	case XCB_ENTER_NOTIFY:
+		wm.last_time = ((xcb_enter_notify_event_t *)ev)->time; break;
+	case XCB_PROPERTY_NOTIFY:
+		wm.last_time = ((xcb_property_notify_event_t *)ev)->time; break;
+	default: break;
+	}
 
 	if (ev->response_type == 0) {
 		event_handle_error((xcb_generic_error_t *)ev);

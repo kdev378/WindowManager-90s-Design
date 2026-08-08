@@ -43,7 +43,10 @@ if [ ! -x "$WM_BIN" ]; then
 fi
 
 _LIB_PIDS=""
+_LIB_CLEANED_UP=0
 _lib_cleanup() {
+	[ "$_LIB_CLEANED_UP" -eq 1 ] && return 0
+	_LIB_CLEANED_UP=1
 	for p in $_LIB_PIDS; do
 		kill "$p" 2>/dev/null || true
 	done
