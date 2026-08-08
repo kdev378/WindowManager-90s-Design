@@ -172,8 +172,14 @@ enum {
 	CF_FIXED_SIZE    = 1u << 12  /* min==max でリサイズ不可 */
 };
 
-/* _NET_WM_SYNC_REQUEST の状態 (SPEC §7.3) */
-enum sync_state { SYNC_IDLE = 0, SYNC_WAITING, SYNC_STALLED, SYNC_NONE };
+/*
+ * _NET_WM_SYNC_REQUEST の状態 (SPEC §7.3)
+ *
+ * **0 値は SYNC_NONE にすること。** ゼロ初期化された client が
+ * 「カウンタを持たない」と読めるのが安全側。当初 SYNC_IDLE を 0 に
+ * していたため、カウンタが無いクライアントが IDLE に見えていた。
+ */
+enum sync_state { SYNC_NONE = 0, SYNC_IDLE, SYNC_WAITING, SYNC_STALLED };
 
 /* ================================================================== *
  * クライアント (SPEC §2.3)

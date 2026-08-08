@@ -342,7 +342,8 @@ static void drag_sync_request(struct client *c, uint64_t now)
 	 */
 	if (c->flags & CF_SYNC_UNFIT)  return;
 
-	(void)now;   /* Phase 3 で c->sync_sent_ms に入れる */
+	(void)now;   /* sync_request が自前で wm_now_ms() を刻む */
+	sync_request(c);
 }
 
 /* 実際にジオメトリを反映する。ここを通ったら last_drag_ms を更新する */
