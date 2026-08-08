@@ -26,7 +26,8 @@ LIBS    = $(PKG_LIBS)
 
 OBJS = src/main.o src/wm.o src/event.o src/client.o src/icccm.o \
        src/ewmh.o src/atoms.o src/stack.o src/focus.o src/move.o \
-       src/layout.o src/input.o src/config.o src/util.o src/type.o
+       src/layout.o src/input.o src/config.o src/util.o src/type.o \
+       src/theme.o src/draw.o src/font.o src/deco.o src/cursor.o src/menu.o
 
 BIN = w98wm
 
@@ -38,7 +39,7 @@ $(BIN): $(OBJS)
 .c.o:
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(OBJS): src/w98wm.h src/atoms.h src/brand.h src/compat.h
+$(OBJS): src/w98wm.h src/atoms.h src/brand.h src/compat.h src/draw.h
 
 clean:
 	rm -f $(BIN) $(OBJS) tests/unit/unit_tests

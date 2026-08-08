@@ -60,7 +60,8 @@
 	 XCB_EVENT_MASK_BUTTON_RELEASE        | \
 	 XCB_EVENT_MASK_POINTER_MOTION        | \
 	 XCB_EVENT_MASK_EXPOSURE              | \
-	 XCB_EVENT_MASK_ENTER_WINDOW)
+	 XCB_EVENT_MASK_ENTER_WINDOW          | \
+	 XCB_EVENT_MASK_LEAVE_WINDOW)   /* ボタンのホバー解除に要る (§4.4) */
 
 /* クライアントウィンドウのイベントマスク (§3.1.0)。
  * PropertyChange でタイトル・ヒント・状態の変化を、

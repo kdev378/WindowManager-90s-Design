@@ -153,7 +153,7 @@ static void event_loop(void)
 
 int main(int argc, char **argv)
 {
-	int i, verbose = 0;
+	int i, verbose = 0, print_font_only = 0;
 
 	for (i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-v") == 0) {
@@ -161,8 +161,12 @@ int main(int argc, char **argv)
 		} else if (strcmp(argv[i], "--version") == 0) {
 			printf("%s %s\n", WM_DISPLAY_NAME, WM_VERSION);
 			return 0;
+		} else if (strcmp(argv[i], "--print-font") == 0) {
+			/* §4.5.1: どの候補が採用されたかを確認する手段 */
+			print_font_only = 1;
 		} else if (strcmp(argv[i], "--help") == 0) {
-			printf("usage: %s [-v] [--replace] [--version]\n", argv[0]);
+			printf("usage: %s [-v] [--replace] [--version] [--print-font]\n",
+			       argv[0]);
 			return 0;
 		}
 	}
@@ -170,6 +174,7 @@ int main(int argc, char **argv)
 	log_init(verbose);
 	config_defaults(&wm.cfg);
 	config_load(&wm.cfg);
+	theme_init();          /* メトリクスと配色。設定のみに依存する */
 
 	if (!setup_signals()) {
 		ERR("シグナルの初期化に失敗");
@@ -177,6 +182,12 @@ int main(int argc, char **argv)
 	}
 	if (!wm_init(argc, argv))
 		return 1;
+
+	if (print_font_only) {
+		printf("%s\n", font_describe());
+		wm_shutdown();
+		return 0;
+	}
 
 	/*
 	 * OpenBSD の権限縮小 (SPEC Phase 5)。X 接続確立後に絞る。
@@ -192,6 +203,11 @@ int main(int argc, char **argv)
 #endif
 
 	event_loop();
+
+	menu_close();
+	cursor_fini();
+	font_fini();
+	draw_fini();
 	wm_shutdown();
 	return 0;
 }

@@ -18,6 +18,7 @@
 #include "brand.h"
 #include "compat.h"
 #include "atoms.h"
+#include "draw.h"
 
 /* ================================================================== *
  * 定数（SPEC §2.3.0, §3.7.1, §4.2）
@@ -231,6 +232,10 @@ struct client {
 
 	uint32_t     user_time;   /* _NET_WM_USER_TIME (§3.6) */
 
+	/* 装飾の対話状態 (§4.4)。ボタンのホバー/押下 */
+	uint8_t      hover_part;  /* enum frame_part */
+	uint8_t      press_part;  /* 押下中の部位。押下したまま外へ出たら解除表示 */
+
 	struct client *next, *prev;       /* スタック順（下→上） */
 	struct client *focus_next;        /* MRU 順 */
 };
@@ -269,7 +274,8 @@ enum {
 
 struct config {
 	/* 外観 */
-	uint32_t color[16];          /* THEME_* で索引。theme.c が定義 */
+	uint32_t color[THEME_COLOR_COUNT];   /* THEME_* で索引 (draw.h) */
+	uint8_t  theme_preset;               /* THEME_PRESET_* */
 	char     font[256];
 	uint8_t  scale;
 
@@ -506,6 +512,52 @@ void input_regrab_keys(void);              /* MappingNotify で呼ぶ */
 bool input_handle_key(xcb_key_press_event_t *ev);
 void input_run_action(uint8_t action, const char *arg, struct client *c);
 void spawn_command(const char *cmd);       /* posix_spawn (§2.2.1) */
+
+/* ================================================================== *
+ * deco.c — フレームの描画と当たり判定 (SPEC §4.3, §4.4, §4.6)
+ * ================================================================== */
+
+/* フレーム上の部位。座標計算で判定し、サブウィンドウは作らない (§3.1) */
+enum frame_part {
+	PART_NONE = 0,
+	PART_CLIENT,
+	PART_TITLE,
+	PART_ICON,
+	PART_BTN_MIN,
+	PART_BTN_MAX,
+	PART_BTN_CLOSE,
+	PART_BORDER_N, PART_BORDER_S, PART_BORDER_E, PART_BORDER_W,
+	PART_BORDER_NE, PART_BORDER_NW, PART_BORDER_SE, PART_BORDER_SW
+};
+
+void deco_draw(struct client *c, const xcb_rectangle_t *clip);
+void deco_invalidate(struct client *c);       /* 次の Expose で全面再描画 */
+/* frame 相対座標から部位を引く */
+enum frame_part deco_hit_test(const struct client *c, int16_t fx, int16_t fy);
+/* 部位に対応するリサイズ辺 (EDGE_* の和)。ボーダー以外は 0 */
+uint8_t deco_part_edge(enum frame_part p);
+/* 部位に対応するカーソル (CURSOR_*) */
+int  deco_part_cursor(enum frame_part p);
+void deco_set_cursor(struct client *c, enum frame_part p);
+
+/* ================================================================== *
+ * menu.c — ポップアップメニュー (SPEC §4.6)
+ *   ウィンドウメニューと Phase 4 のスタートメニューで共用する
+ * ================================================================== */
+
+struct menu_item {
+	const char *label;
+	uint8_t     action;      /* ACT_* */
+	const char *accel;       /* "Alt+F4" 等。右寄せ表示。NULL 可 */
+	bool        enabled;
+	bool        separator;
+};
+
+void menu_open_window_menu(struct client *c, int16_t root_x, int16_t root_y);
+bool menu_active(void);
+void menu_close(void);
+/* メニューが開いている間はイベントをここへ回す。処理したら true */
+bool menu_handle_event(xcb_generic_event_t *ev);
 
 /* ================================================================== *
  * event.c — ディスパッチ

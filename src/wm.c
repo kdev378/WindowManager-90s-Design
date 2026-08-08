@@ -331,6 +331,20 @@ bool wm_init(int argc, char **argv)
 	ewmh_init();
 	layout_update_monitors();
 	ewmh_update_desktop_props();
+
+	/*
+	 * 描画系の初期化 (Phase 2)。
+	 * **wm_scan_existing() より前でなければならない** — adopt するウィンドウの
+	 * フレームは client_manage が作るので、その時点でテーマ・フォント・
+	 * カーソルが揃っていないと未初期化の値で描くことになる。
+	 * いずれも失敗を fatal にしない (§4.5 の保証)。
+	 */
+	draw_init();
+	if (!font_init(wm.cfg.font[0] ? wm.cfg.font : NULL))
+		ERR("フォントを 1 つも開けなかった。内蔵フォントで続行する");
+	LOG("フォント: %s", font_describe());
+	cursor_init();
+
 	input_init();
 	focus_none();
 
