@@ -38,6 +38,9 @@ Phase 3 の減分は Xinerama 経路を実装しないと確定したこと（SP
 - `src/atoms.c` — アトムテーブルと `implemented` フラグ（SPEC §5.2.1）。
   `_NET_SUPPORTED` はこのフラグから生成する。フェーズ進行に伴って昇格させる
 - `src/compat.h` — Linux / OpenBSD の差分吸収（`strlcpy`, `pledge`, `posix_spawn`, poll）
+- `src/brand.h` — 名称に関わる文字列の一元定義（SPEC §11.1）。名称は実装後に決めるため、
+  バイナリ名・設定パス・`WM_CLASS`・ログ接頭辞をここだけで差し替えられる状態を保つ。
+  CI で「ソース中に仮称のリテラルが直接書かれていないこと」を `grep` で検査する
 - `src/util.c` — スラブアロケータ、ログ（`-v` で stderr、既定は無出力）
 - `tools/run-xephyr.sh` — Xephyr 上で w98wm を起動し、テスト用アプリを配置する
 - `tools/memcheck.sh` — SPEC §9.1 の **M0 / M1 / M20 / M20h** の 4 条件を測定し表形式で出力。
