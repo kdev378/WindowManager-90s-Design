@@ -168,6 +168,14 @@ uint16_t font_height(void);
  * 塗り潰すため、グラデーションのタイトルバーで使えない。
  * CJK ランの切替はこのリクエスト内のフォント切替アイテムで行う。
  * bg には触れない（呼び出し側が事前に塗る）。
+ *
+ * y は**ベースライン**の位置（PolyText16 の定義に合わせる）。
+ * 呼び出し側は「描画領域の上端 + font_ascent()」を渡すこと。
+ * ここを上端と誤解すると文字が全体的に上へずれる。
+ *
+ * len は UTF-8 の**バイト数**。struct client の draw_glyphs は
+ * UCS-2 の**グリフ数**なので、両者は別物である点に注意
+ * （呼び出し側で N グリフ目のバイト位置を求める必要がある）。
  */
 void font_draw(xcb_drawable_t d, int16_t x, int16_t y,
                const char *utf8, size_t len, uint32_t color);

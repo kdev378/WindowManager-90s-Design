@@ -72,8 +72,18 @@ winhex=$(to_hex "$win")
 xdotool windowactivate --sync "$win" >/dev/null 2>&1 || true
 sleep 0.5
 
-frame_hex=$(get_parent_window "$winhex")
-[ -n "$frame_hex" ] || skip "xwininfo が使えず frame ウィンドウを特定できません"
+# lib.sh の get_parent_window() は "-children" を付けずに xwininfo を呼ぶため、
+# 手元の xwininfo (x11-apps 由来) では "Parent window id:" 行自体が出ず、
+# 常に空を返してしまう (020-map-manage.sh 等が持つフォールバックはこれを
+# 前提にしている)。このテストは frame の実体そのものが要るので、
+# "-children" 付きで自前に取得する。
+find_frame_window() {
+	xwininfo -display "$DISPLAY" -id "$1" -children 2>/dev/null |
+		awk '/Parent window id:/ { print $4; exit }'
+}
+
+frame_hex=$(find_frame_window "$winhex")
+[ -n "$frame_hex" ] || skip "xwininfo で frame ウィンドウを特定できません"
 
 root=$(get_root_window)
 if [ -n "$root" ] && [ "$frame_hex" = "$root" ]; then

@@ -302,8 +302,18 @@ void input_run_action(uint8_t action, const char *arg, struct client *c)
 		break;
 
 	case ACT_WINDOW_MENU:
-		/* Win98 風ウィンドウメニュー (§4.6) は未実装のメニューモジュール
-		 * 待ち。Phase 4 で描画とハンドリングを追加する。 */
+		/*
+		 * Alt+Space (§4.6)。キーボード起動なのでポインタ座標が無い。
+		 * Windows と同じく、タイトルバーの左下（アイコンの真下）に出す。
+		 * マウス経由の起動は event.c がポインタ座標を渡す。
+		 */
+		if (c) {
+			uint16_t l, r, t, b;
+			client_frame_offsets(c, &l, &r, &t, &b);
+			menu_open_window_menu(c,
+				(int16_t)(c->geom.x - l),
+				(int16_t)(c->geom.y));
+		}
 		break;
 
 	case ACT_MOVE_KB:

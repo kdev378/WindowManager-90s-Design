@@ -422,6 +422,19 @@ bool ewmh_handle_client_message(xcb_client_message_event_t *ev)
 	struct client *c;
 
 	switch (idx) {
+	/*
+	 * _GTK_SHOW_WINDOW_MENU (SPEC §7.2)
+	 * GTK のヘッダバー右クリックはこれを送ってくる。未対応だと CSD アプリで
+	 * ウィンドウメニューを開く手段が無くなる。
+	 * data32[0]=device id, data32[1]=x, data32[2]=y (ルート座標)。
+	 */
+	case ATOM_GTK_SHOW_WINDOW_MENU:
+		c = client_find(ev->window);
+		if (c != NULL)
+			menu_open_window_menu(c, (int16_t)ev->data.data32[1],
+			                      (int16_t)ev->data.data32[2]);
+		return true;
+
 	case ATOM_NET_WM_STATE:
 		c = client_find(ev->window);
 		if (c != NULL)

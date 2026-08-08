@@ -1,0 +1,1363 @@
+/*
+ * font.c - フォントの解決・計測・描画 (SPEC §4.5)
+ *
+ * 対応する仕様:
+ *   §4.5.1   9 段階フォールバックチェーン（起動を失敗させない）
+ *   §4.5.2   幅の計測と QueryFont 禁止
+ *   §4.5.2.1 計測結果のキャッシュ（描画経路で往復しない）
+ *   §4.5.3   内蔵ビットマップフォント
+ *   §4.5.4   CJK 補助フォントのラン分割（コード範囲で判定）
+ *   §4.5.4.1 ImageText16 禁止・PolyText16 を使う
+ *   §4.5.5   多言語表示の保証範囲
+ *
+ * ------------------------------------------------------------------
+ * このファイルを読むときに真っ先に知っておくべき 3 つの禁止事項
+ * （どれも「なぜ駄目なのか」がコードからは読み取れない。設計レビュー
+ *   6 巡の結論であり、破ると必ず後で刺さる）
+ *
+ *  (1) ImageText16 / ImageText8 を使ってはならない (§4.5.4.1)。
+ *      X プロトコルの定義上、ImageText* は文字を描く前に文字列の
+ *      バウンディング矩形を GC の *背景色* で塗り潰す。タイトルバーは
+ *      水平グラデーション (§4.4) なので、文字の背後に単色の箱が出る。
+ *      §4.0 の「1 ピクセルの差も許容しない」要求を満たせなくなる。
+ *      → 前景のみを描く PolyText16 を使う。
+ *
+ *  (2) 16bit フォントに QueryFont を投げてはならない (§4.5.2)。
+ *      QueryFont のリプライには *フォントの全文字* の per-char メトリクス
+ *      (12B/字) が入る。iso10646-1 の大きなフォントでは数百 KB になり、
+ *      一時的とはいえ §9 の 1 MB 目標を単独で吹き飛ばす。
+ *      → max_byte1 == 0（256 文字以下）のときだけ QueryFont を使い、
+ *        ASCII の幅表を写し取って即座に free する。
+ *        16bit フォントのメトリクスは ListFontsWithInfo の FONTINFO と
+ *        QueryTextExtents だけで賄う。
+ *
+ *  (3) font_text_width() / font_measure_fit() を描画経路から呼んでは
+ *      ならない (§4.5.2.1)。この 2 つだけがラウンドトリップを許された
+ *      関数である。ライブ移動 (§3.4) でウィンドウを他のウィンドウの上に
+ *      ドラッグすると、コンポジタ非使用の X では下のウィンドウの露出領域
+ *      ごとに Expose が飛ぶ。60Hz でドラッグすれば下にあるウィンドウ群の
+ *      タイトルが毎フレーム再描画され、そのたびに同期往復が走る。
+ *      §3.4.1 が想定する 30ms RTT のリモート X では毎秒数百往復となり
+ *      画面全体が止まる。struct client の draw_glyphs / draw_ellipsis /
+ *      caption_w_at_measure というキャッシュはこのために存在する。
+ *      呼んでよいのはタイトル変更時 (PropertyNotify) と
+ *      キャプション幅の変化時だけ。font_draw() は一切往復しない。
+ * ------------------------------------------------------------------
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <xcb/xcb.h>
+#include <xcb/xproto.h>
+
+#include "w98wm.h"
+
+/* ================================================================== *
+ * 定数
+ * ================================================================== */
+
+/* 1 回の描画・計測で扱う UCS-2 の上限。タイトルは WM_TITLE_MAX バイトなので
+ * グリフ数はこれを超えない。 */
+#define FONT_MAX_GLYPHS   256
+
+/* PolyText16 のテキストアイテムあたりの上限。255 はフォント切替の標識に
+ * 予約されているため 254 (§4.5.4.1)。 */
+#define POLYTEXT_MAX_ITEM 254
+
+/*
+ * アイテム列のバッファ。最悪ケースは 1 文字ごとにフォントが入れ替わる場合で
+ * 1 文字あたり「切替 5B + ヘッダ 2B + 文字 2B = 9B」。
+ */
+#define POLYTEXT_BUF      (FONT_MAX_GLYPHS * 9 + 16)
+
+/* QueryTextExtents を投げるランの上限。これを超えたぶんはプライマリで測る */
+#define FONT_MAX_RUNS      64
+
+/* 内蔵フォント (§4.5.3) のセル形状 */
+#define BI_COLS      5     /* グリフの最大インク幅 */
+#define BI_ROWS     11     /* セル高 */
+#define BI_ASCENT    9     /* ベースラインはセル行 9（行 9,10 がディセンダ） */
+#define BI_FIRST  0x20
+#define BI_NGLYPH  224     /* U+0020 .. U+00FF */
+#define BI_BOX      95     /* U+007F の枠グリフ = 豆腐 */
+#define BI_GRID     16     /* アトラスの横方向セル数 */
+#define BI_CELL_W    8     /* アトラスのセル間隔（インク 5 + 余白） */
+#define BI_SPACE_W   4     /* 空白グリフの送り幅 */
+
+/* ================================================================== *
+ * 内蔵ビットマップフォントのグリフデータ (SPEC §4.5.3)
+ *
+ * 5 列 × 11 行 / グリフ。1 バイト 1 行、bit4 が左端の列。
+ * セル行の意味:
+ *    0..1  アクセント帯（Latin-1 の合成済みダイアクリティカル）
+ *    2..8  大文字・数字の本体（cap height 7）
+ *    4..8  小文字の x-height（5）
+ *    9..10 ディセンダ / セディーユ（ベースラインはセル行 9）
+ *
+ * 収録: U+0020..U+007E は実グリフ。U+00A0..U+00FF はアクセント合成
+ * （À Á Â Ã Ä Å Ç È..Ï Ñ Ò..Ö Ù..Ü Ý ß æ Æ ø Ø µ 等）と主要な約物。
+ * 未収録のコードポイントは枠（豆腐）で描く。
+ * 幅表は起動時にインク範囲から算出する（§4.5.3 の「常駐は幅表のみ」）。
+ * ================================================================== */
+
+static const uint8_t bi_glyphs[BI_NGLYPH][BI_ROWS] = {
+	/* U+0020 */ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+0021 */ { 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04, 0x00, 0x00 },
+	/* U+0022 */ { 0x00, 0x00, 0x0A, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+0023 */ { 0x00, 0x00, 0x00, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x00, 0x00, 0x00 },
+	/* U+0024 */ { 0x00, 0x00, 0x04, 0x0F, 0x14, 0x0E, 0x05, 0x1E, 0x04, 0x00, 0x00 },
+	/* U+0025 */ { 0x00, 0x00, 0x00, 0x19, 0x1A, 0x04, 0x0B, 0x13, 0x00, 0x00, 0x00 },
+	/* U+0026 */ { 0x00, 0x00, 0x0C, 0x12, 0x14, 0x08, 0x15, 0x12, 0x0D, 0x00, 0x00 },
+	/* U+0027 */ { 0x00, 0x00, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+0028 */ { 0x00, 0x00, 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02, 0x00, 0x00 },
+	/* U+0029 */ { 0x00, 0x00, 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08, 0x00, 0x00 },
+	/* U+002A */ { 0x00, 0x00, 0x00, 0x04, 0x15, 0x0E, 0x15, 0x04, 0x00, 0x00, 0x00 },
+	/* U+002B */ { 0x00, 0x00, 0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00, 0x00, 0x00 },
+	/* U+002C */ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x04, 0x08, 0x00 },
+	/* U+002D */ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+002E */ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00 },
+	/* U+002F */ { 0x00, 0x00, 0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10, 0x00, 0x00 },
+	/* U+0030 */ { 0x00, 0x00, 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+0031 */ { 0x00, 0x00, 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00 },
+	/* U+0032 */ { 0x00, 0x00, 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F, 0x00, 0x00 },
+	/* U+0033 */ { 0x00, 0x00, 0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+0034 */ { 0x00, 0x00, 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02, 0x00, 0x00 },
+	/* U+0035 */ { 0x00, 0x00, 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+0036 */ { 0x00, 0x00, 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+0037 */ { 0x00, 0x00, 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08, 0x00, 0x00 },
+	/* U+0038 */ { 0x00, 0x00, 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+0039 */ { 0x00, 0x00, 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C, 0x00, 0x00 },
+	/* U+003A */ { 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00 },
+	/* U+003B */ { 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x04, 0x04, 0x08, 0x00 },
+	/* U+003C */ { 0x00, 0x00, 0x00, 0x02, 0x04, 0x08, 0x04, 0x02, 0x00, 0x00, 0x00 },
+	/* U+003D */ { 0x00, 0x00, 0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00, 0x00, 0x00 },
+	/* U+003E */ { 0x00, 0x00, 0x00, 0x08, 0x04, 0x02, 0x04, 0x08, 0x00, 0x00, 0x00 },
+	/* U+003F */ { 0x00, 0x00, 0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04, 0x00, 0x00 },
+	/* U+0040 */ { 0x00, 0x00, 0x0E, 0x11, 0x17, 0x15, 0x17, 0x10, 0x0E, 0x00, 0x00 },
+	/* U+0041 */ { 0x00, 0x00, 0x04, 0x0A, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x00, 0x00 },
+	/* U+0042 */ { 0x00, 0x00, 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E, 0x00, 0x00 },
+	/* U+0043 */ { 0x00, 0x00, 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+0044 */ { 0x00, 0x00, 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E, 0x00, 0x00 },
+	/* U+0045 */ { 0x00, 0x00, 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F, 0x00, 0x00 },
+	/* U+0046 */ { 0x00, 0x00, 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10, 0x00, 0x00 },
+	/* U+0047 */ { 0x00, 0x00, 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+0048 */ { 0x00, 0x00, 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11, 0x00, 0x00 },
+	/* U+0049 */ { 0x00, 0x00, 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00 },
+	/* U+004A */ { 0x00, 0x00, 0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C, 0x00, 0x00 },
+	/* U+004B */ { 0x00, 0x00, 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11, 0x00, 0x00 },
+	/* U+004C */ { 0x00, 0x00, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F, 0x00, 0x00 },
+	/* U+004D */ { 0x00, 0x00, 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11, 0x00, 0x00 },
+	/* U+004E */ { 0x00, 0x00, 0x11, 0x19, 0x19, 0x15, 0x13, 0x13, 0x11, 0x00, 0x00 },
+	/* U+004F */ { 0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+0050 */ { 0x00, 0x00, 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10, 0x00, 0x00 },
+	/* U+0051 */ { 0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D, 0x00, 0x00 },
+	/* U+0052 */ { 0x00, 0x00, 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11, 0x00, 0x00 },
+	/* U+0053 */ { 0x00, 0x00, 0x0E, 0x11, 0x10, 0x0E, 0x01, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+0054 */ { 0x00, 0x00, 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00 },
+	/* U+0055 */ { 0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+0056 */ { 0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04, 0x00, 0x00 },
+	/* U+0057 */ { 0x00, 0x00, 0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11, 0x00, 0x00 },
+	/* U+0058 */ { 0x00, 0x00, 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11, 0x00, 0x00 },
+	/* U+0059 */ { 0x00, 0x00, 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00 },
+	/* U+005A */ { 0x00, 0x00, 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F, 0x00, 0x00 },
+	/* U+005B */ { 0x00, 0x00, 0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E, 0x00, 0x00 },
+	/* U+005C */ { 0x00, 0x00, 0x10, 0x10, 0x08, 0x04, 0x02, 0x01, 0x01, 0x00, 0x00 },
+	/* U+005D */ { 0x00, 0x00, 0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E, 0x00, 0x00 },
+	/* U+005E */ { 0x00, 0x00, 0x04, 0x0A, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+005F */ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F, 0x00 },
+	/* U+0060 */ { 0x00, 0x00, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+0061 */ { 0x00, 0x00, 0x00, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F, 0x00, 0x00 },
+	/* U+0062 */ { 0x00, 0x00, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x1E, 0x00, 0x00 },
+	/* U+0063 */ { 0x00, 0x00, 0x00, 0x00, 0x0E, 0x11, 0x10, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+0064 */ { 0x00, 0x00, 0x01, 0x01, 0x0F, 0x11, 0x11, 0x11, 0x0F, 0x00, 0x00 },
+	/* U+0065 */ { 0x00, 0x00, 0x00, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0E, 0x00, 0x00 },
+	/* U+0066 */ { 0x00, 0x00, 0x06, 0x08, 0x1E, 0x08, 0x08, 0x08, 0x08, 0x00, 0x00 },
+	/* U+0067 */ { 0x00, 0x00, 0x00, 0x00, 0x0F, 0x11, 0x11, 0x11, 0x0F, 0x01, 0x0E },
+	/* U+0068 */ { 0x00, 0x00, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x11, 0x00, 0x00 },
+	/* U+0069 */ { 0x00, 0x00, 0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00 },
+	/* U+006A */ { 0x00, 0x00, 0x02, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C },
+	/* U+006B */ { 0x00, 0x00, 0x10, 0x10, 0x12, 0x14, 0x18, 0x14, 0x12, 0x00, 0x00 },
+	/* U+006C */ { 0x00, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00 },
+	/* U+006D */ { 0x00, 0x00, 0x00, 0x00, 0x1A, 0x15, 0x15, 0x15, 0x15, 0x00, 0x00 },
+	/* U+006E */ { 0x00, 0x00, 0x00, 0x00, 0x1E, 0x11, 0x11, 0x11, 0x11, 0x00, 0x00 },
+	/* U+006F */ { 0x00, 0x00, 0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+0070 */ { 0x00, 0x00, 0x00, 0x00, 0x1E, 0x11, 0x11, 0x11, 0x1E, 0x10, 0x10 },
+	/* U+0071 */ { 0x00, 0x00, 0x00, 0x00, 0x0F, 0x11, 0x11, 0x11, 0x0F, 0x01, 0x01 },
+	/* U+0072 */ { 0x00, 0x00, 0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10, 0x00, 0x00 },
+	/* U+0073 */ { 0x00, 0x00, 0x00, 0x00, 0x0F, 0x10, 0x0E, 0x01, 0x1E, 0x00, 0x00 },
+	/* U+0074 */ { 0x00, 0x00, 0x08, 0x08, 0x1E, 0x08, 0x08, 0x09, 0x06, 0x00, 0x00 },
+	/* U+0075 */ { 0x00, 0x00, 0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x0F, 0x00, 0x00 },
+	/* U+0076 */ { 0x00, 0x00, 0x00, 0x00, 0x11, 0x11, 0x11, 0x0A, 0x04, 0x00, 0x00 },
+	/* U+0077 */ { 0x00, 0x00, 0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0A, 0x00, 0x00 },
+	/* U+0078 */ { 0x00, 0x00, 0x00, 0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x00, 0x00 },
+	/* U+0079 */ { 0x00, 0x00, 0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x0F, 0x01, 0x0E },
+	/* U+007A */ { 0x00, 0x00, 0x00, 0x00, 0x1F, 0x02, 0x04, 0x08, 0x1F, 0x00, 0x00 },
+	/* U+007B */ { 0x00, 0x00, 0x06, 0x04, 0x04, 0x08, 0x04, 0x04, 0x06, 0x00, 0x00 },
+	/* U+007C */ { 0x00, 0x00, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00 },
+	/* U+007D */ { 0x00, 0x00, 0x0C, 0x04, 0x04, 0x02, 0x04, 0x04, 0x0C, 0x00, 0x00 },
+	/* U+007E */ { 0x00, 0x00, 0x00, 0x00, 0x0D, 0x13, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+007F */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0080 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0081 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0082 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0083 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0084 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0085 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0086 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0087 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0088 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0089 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+008A */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+008B */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+008C */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+008D */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+008E */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+008F */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0090 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0091 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0092 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0093 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0094 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0095 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0096 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0097 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0098 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+0099 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+009A */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+009B */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+009C */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+009D */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+009E */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+009F */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00A0 */ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+00A1 */ { 0x00, 0x00, 0x00, 0x04, 0x00, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00 },
+	/* U+00A2 */ { 0x00, 0x00, 0x04, 0x0E, 0x14, 0x14, 0x14, 0x0E, 0x04, 0x00, 0x00 },
+	/* U+00A3 */ { 0x00, 0x00, 0x06, 0x08, 0x1C, 0x08, 0x08, 0x08, 0x1E, 0x00, 0x00 },
+	/* U+00A4 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00A5 */ { 0x00, 0x00, 0x11, 0x0A, 0x1F, 0x04, 0x1F, 0x04, 0x04, 0x00, 0x00 },
+	/* U+00A6 */ { 0x00, 0x00, 0x04, 0x04, 0x04, 0x00, 0x04, 0x04, 0x04, 0x00, 0x00 },
+	/* U+00A7 */ { 0x00, 0x00, 0x0E, 0x10, 0x0C, 0x12, 0x06, 0x01, 0x0E, 0x00, 0x00 },
+	/* U+00A8 */ { 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+00A9 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00AA */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00AB */ { 0x00, 0x00, 0x00, 0x00, 0x0A, 0x14, 0x0A, 0x00, 0x00, 0x00, 0x00 },
+	/* U+00AC */ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E, 0x02, 0x00, 0x00, 0x00, 0x00 },
+	/* U+00AD */ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+00AE */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00AF */ { 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+00B0 */ { 0x00, 0x00, 0x0C, 0x12, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+00B1 */ { 0x00, 0x00, 0x00, 0x04, 0x04, 0x1F, 0x04, 0x00, 0x1F, 0x00, 0x00 },
+	/* U+00B2 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00B3 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00B4 */ { 0x00, 0x00, 0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+00B5 */ { 0x00, 0x00, 0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x1E, 0x10, 0x10 },
+	/* U+00B6 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00B7 */ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	/* U+00B8 */ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x0C },
+	/* U+00B9 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00BA */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00BB */ { 0x00, 0x00, 0x00, 0x00, 0x0A, 0x05, 0x0A, 0x00, 0x00, 0x00, 0x00 },
+	/* U+00BC */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00BD */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00BE */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00BF */ { 0x00, 0x00, 0x00, 0x04, 0x00, 0x04, 0x08, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00C0 */ { 0x08, 0x04, 0x04, 0x0A, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x00, 0x00 },
+	/* U+00C1 */ { 0x02, 0x04, 0x04, 0x0A, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x00, 0x00 },
+	/* U+00C2 */ { 0x04, 0x0A, 0x04, 0x0A, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x00, 0x00 },
+	/* U+00C3 */ { 0x0D, 0x13, 0x04, 0x0A, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x00, 0x00 },
+	/* U+00C4 */ { 0x0A, 0x00, 0x04, 0x0A, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x00, 0x00 },
+	/* U+00C5 */ { 0x04, 0x0A, 0x04, 0x0A, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x00, 0x00 },
+	/* U+00C6 */ { 0x00, 0x00, 0x0F, 0x14, 0x14, 0x17, 0x1E, 0x14, 0x17, 0x00, 0x00 },
+	/* U+00C7 */ { 0x00, 0x00, 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E, 0x04, 0x0C },
+	/* U+00C8 */ { 0x08, 0x04, 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F, 0x00, 0x00 },
+	/* U+00C9 */ { 0x02, 0x04, 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F, 0x00, 0x00 },
+	/* U+00CA */ { 0x04, 0x0A, 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F, 0x00, 0x00 },
+	/* U+00CB */ { 0x0A, 0x00, 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F, 0x00, 0x00 },
+	/* U+00CC */ { 0x08, 0x04, 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00 },
+	/* U+00CD */ { 0x02, 0x04, 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00 },
+	/* U+00CE */ { 0x04, 0x0A, 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00 },
+	/* U+00CF */ { 0x0A, 0x00, 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00 },
+	/* U+00D0 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00D1 */ { 0x0D, 0x13, 0x11, 0x19, 0x19, 0x15, 0x13, 0x13, 0x11, 0x00, 0x00 },
+	/* U+00D2 */ { 0x08, 0x04, 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00D3 */ { 0x02, 0x04, 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00D4 */ { 0x04, 0x0A, 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00D5 */ { 0x0D, 0x13, 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00D6 */ { 0x0A, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00D7 */ { 0x00, 0x00, 0x00, 0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x00, 0x00 },
+	/* U+00D8 */ { 0x00, 0x00, 0x0E, 0x13, 0x15, 0x15, 0x19, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00D9 */ { 0x08, 0x04, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00DA */ { 0x02, 0x04, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00DB */ { 0x04, 0x0A, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00DC */ { 0x0A, 0x00, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00DD */ { 0x02, 0x04, 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00 },
+	/* U+00DE */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00DF */ { 0x00, 0x00, 0x0C, 0x12, 0x12, 0x14, 0x12, 0x12, 0x16, 0x00, 0x00 },
+	/* U+00E0 */ { 0x00, 0x08, 0x04, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F, 0x00, 0x00 },
+	/* U+00E1 */ { 0x00, 0x02, 0x04, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F, 0x00, 0x00 },
+	/* U+00E2 */ { 0x00, 0x04, 0x0A, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F, 0x00, 0x00 },
+	/* U+00E3 */ { 0x00, 0x0D, 0x13, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F, 0x00, 0x00 },
+	/* U+00E4 */ { 0x00, 0x0A, 0x00, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F, 0x00, 0x00 },
+	/* U+00E5 */ { 0x00, 0x04, 0x0A, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F, 0x00, 0x00 },
+	/* U+00E6 */ { 0x00, 0x00, 0x00, 0x00, 0x0D, 0x05, 0x0F, 0x14, 0x0D, 0x00, 0x00 },
+	/* U+00E7 */ { 0x00, 0x00, 0x00, 0x00, 0x0E, 0x11, 0x10, 0x11, 0x0E, 0x04, 0x0C },
+	/* U+00E8 */ { 0x00, 0x08, 0x04, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0E, 0x00, 0x00 },
+	/* U+00E9 */ { 0x00, 0x02, 0x04, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0E, 0x00, 0x00 },
+	/* U+00EA */ { 0x00, 0x04, 0x0A, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0E, 0x00, 0x00 },
+	/* U+00EB */ { 0x00, 0x0A, 0x00, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0E, 0x00, 0x00 },
+	/* U+00EC */ { 0x00, 0x08, 0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00 },
+	/* U+00ED */ { 0x00, 0x02, 0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00 },
+	/* U+00EE */ { 0x00, 0x04, 0x0A, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00 },
+	/* U+00EF */ { 0x00, 0x0A, 0x00, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00 },
+	/* U+00F0 */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00F1 */ { 0x00, 0x0D, 0x13, 0x00, 0x1E, 0x11, 0x11, 0x11, 0x11, 0x00, 0x00 },
+	/* U+00F2 */ { 0x00, 0x08, 0x04, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00F3 */ { 0x00, 0x02, 0x04, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00F4 */ { 0x00, 0x04, 0x0A, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00F5 */ { 0x00, 0x0D, 0x13, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00F6 */ { 0x00, 0x0A, 0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00 },
+	/* U+00F7 */ { 0x00, 0x00, 0x00, 0x04, 0x00, 0x1F, 0x00, 0x04, 0x00, 0x00, 0x00 },
+	/* U+00F8 */ { 0x00, 0x00, 0x00, 0x00, 0x0F, 0x13, 0x15, 0x19, 0x1E, 0x00, 0x00 },
+	/* U+00F9 */ { 0x00, 0x08, 0x04, 0x00, 0x11, 0x11, 0x11, 0x11, 0x0F, 0x00, 0x00 },
+	/* U+00FA */ { 0x00, 0x02, 0x04, 0x00, 0x11, 0x11, 0x11, 0x11, 0x0F, 0x00, 0x00 },
+	/* U+00FB */ { 0x00, 0x04, 0x0A, 0x00, 0x11, 0x11, 0x11, 0x11, 0x0F, 0x00, 0x00 },
+	/* U+00FC */ { 0x00, 0x0A, 0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x0F, 0x00, 0x00 },
+	/* U+00FD */ { 0x00, 0x02, 0x04, 0x00, 0x11, 0x11, 0x11, 0x11, 0x0F, 0x01, 0x0E },
+	/* U+00FE */ { 0x00, 0x00, 0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F, 0x00, 0x00 },
+	/* U+00FF */ { 0x00, 0x0A, 0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x0F, 0x01, 0x0E },
+};
+
+/* ================================================================== *
+ * 状態
+ * ================================================================== */
+
+/*
+ * ListFontsWithInfo (§4.5.1) で得た FONTINFO の写し。
+ * QueryFont を禁止した以上、16bit フォントのメトリクスを得る手段は
+ * これしかない。フォント選択時に一度だけ控え、以後は再取得しない。
+ */
+struct core_font {
+	xcb_font_t id;
+	uint8_t    min_byte1, max_byte1;
+	uint16_t   min_char,  max_char;    /* min/max_char_or_byte2 */
+	uint16_t   default_char;
+	int16_t    ascent, descent;        /* font_ascent / font_descent */
+	int16_t    max_width;              /* max_bounds.character_width */
+	bool       open;
+	char       name[256];
+};
+
+static struct core_font g_pri;         /* プライマリ (§4.5.1) */
+static struct core_font g_aux;         /* CJK 補助 (§4.5.4)。1 つだけ */
+static bool     g_have_aux;
+
+static bool     g_builtin;             /* 候補 1-8 が全滅して内蔵に落ちた */
+static bool     g_ready;               /* 何かしら描ける状態か */
+
+static xcb_gcontext_t g_gc = XCB_NONE; /* font.c 専用の GC（後述） */
+static xcb_font_t     g_gc_font;       /* GC に現在設定されている font */
+static uint32_t       g_gc_fg = 0xFFFFFFFFu; /* 直前に設定した前景色 */
+
+static uint16_t g_ascent, g_descent;
+static char     g_desc[640];   /* 名前 255B x2 + 装飾が収まる大きさ */
+
+/* 8bit フォント (max_byte1 == 0) のときだけ持つ ASCII 幅表 (§4.5.2) */
+static uint16_t g_ascii_w[95];
+static bool     g_have_ascii_w;
+
+/* "..." の幅。計測は往復を伴うので一度だけ求めて使い回す */
+static int32_t  g_ellipsis_w = -1;
+static uint32_t ellipsis_width(void);   /* 定義は計測セクション */
+
+/* 内蔵フォント */
+static xcb_pixmap_t g_atlas = XCB_NONE;
+static uint8_t      g_bi_adv[BI_NGLYPH];   /* 送り幅（scale 適用済み） */
+static uint8_t      g_bi_trim[BI_NGLYPH];  /* 左トリム量（未使用列） */
+static uint16_t     g_cell_w, g_cell_h;    /* scale 適用済みセル寸法 */
+static uint8_t      g_scale = 1;
+
+/* PolyText16 のアイテム列（描画経路で malloc しない） */
+static uint8_t  g_items[POLYTEXT_BUF];
+
+/* ================================================================== *
+ * 小道具
+ * ================================================================== */
+
+static uint8_t font_scale(void)
+{
+	uint8_t s = wm.cfg.scale;
+
+	return (s == 2) ? 2 : 1;
+}
+
+/*
+ * 文字 c がこのフォントのコード範囲に入るか (§4.5.4)。
+ * 範囲内でも個々のグリフが未定義のことはあり、その場合はサーバが
+ * default_char に置換する（多くは豆腐）。それを検出するには per-char
+ * メトリクス＝ QueryFont が要るので行わない（§4.5.2 の禁止事項 (2)）。
+ */
+static bool cf_covers(const struct core_font *f, uint16_t c)
+{
+	uint8_t b1 = (uint8_t)(c >> 8);
+	uint8_t b2 = (uint8_t)(c & 0xFFu);
+
+	if (!f->open)
+		return false;
+	if (f->max_byte1 == 0)   /* 線形インデックス（256 文字以下） */
+		return b1 == 0 && b2 >= f->min_char && b2 <= f->max_char;
+	return b1 >= f->min_byte1 && b1 <= f->max_byte1 &&
+	       b2 >= f->min_char  && b2 <= f->max_char;
+}
+
+/* この文字をどのフォントで描くか (§4.5.4 の擬似コードそのもの) */
+static xcb_font_t font_for(uint16_t c)
+{
+	if (cf_covers(&g_pri, c))
+		return g_pri.id;
+	if (g_have_aux && cf_covers(&g_aux, c))
+		return g_aux.id;
+	/* どちらの範囲にも無い → プライマリに投げて default_char を描かせる */
+	return g_pri.id;
+}
+
+static size_t font_to_ucs2(const char *utf8, size_t len, uint16_t *out)
+{
+	if (utf8 == NULL || len == 0)
+		return 0;
+	return utf8_to_ucs2(utf8, len, out, FONT_MAX_GLYPHS);
+}
+
+/* ================================================================== *
+ * §4.5.1 フォールバックチェーン
+ * ================================================================== */
+
+/*
+ * 候補表。px != 0 のものは pat に %u を 1 つ含み、px * scale で埋める。
+ *
+ * 【パターン構文の注意】X のフォント名マッチングで使えるワイルドカードは
+ * '*' と '?' の 2 つだけである。'[0-4]' のような文字クラスは存在せず、
+ * '[' はリテラルとして扱われて永久に 0 件マッチになる。したがって
+ * SPEC の候補 7 のような「サイズの総当たり」は、1 つのパターンにまとめず
+ * 個別のパターンとして順に照会する。
+ *
+ * scale = 2 のときは 11px ではなく 22px を照会する (§4.2)。22px の
+ * ビットマップフォントは滅多に無いので、実際には内蔵フォントの
+ * アトラスを 2 倍に拡大して使うことになる。
+ */
+static const struct font_cand {
+	const char *pat;
+	uint8_t     px;      /* 0 なら pat をそのまま使う */
+} g_cands[] = {
+	/* 2  */ { "-*-tahoma-medium-r-normal--%u-*-*-*-p-*-iso10646-1",      11 },
+	/* 3  */ { "-*-helvetica-medium-r-normal--%u-*-*-*-p-*-iso10646-1",   11 },
+	/* 4  */ { "-*-helvetica-medium-r-normal--%u-*-*-*-p-*-iso8859-1",    11 },
+	/* 4b */ { "-*-lucida-medium-r-normal-sans-%u-*-*-*-p-*-iso10646-1",  11 },
+	/* 5  */ { "-misc-fixed-medium-r-normal--%u-*-*-*-*-*-iso10646-1",    13 },
+	/* 6  */ { "-misc-fixed-medium-r-normal--%u-*-*-*-*-*-iso8859-1",     13 },
+	/* 7  */ { "-*-*-medium-r-normal--%u-*-*-*-*-*-iso10646-1",           11 },
+	/* 7  */ { "-*-*-medium-r-normal--%u-*-*-*-*-*-iso10646-1",           12 },
+	/* 7  */ { "-*-*-medium-r-normal--%u-*-*-*-*-*-iso10646-1",           13 },
+	/* 7  */ { "-*-*-medium-r-normal--%u-*-*-*-*-*-iso10646-1",           10 },
+	/* 7  */ { "-*-*-medium-r-normal--%u-*-*-*-*-*-iso10646-1",           14 },
+	/* 7  */ { "-*-*-medium-r-normal--%u-*-*-*-*-*-iso8859-1",            11 },
+	/* 7  */ { "-*-*-medium-r-normal--%u-*-*-*-*-*-iso8859-1",            13 },
+	/* 8  */ { "fixed",                                                    0 }
+};
+
+/* CJK 補助フォントの候補 (§4.5.4)。開くのは 1 つだけ */
+static const struct font_cand g_aux_cands[] = {
+	{ "-*-*-medium-r-normal--%u-*-*-*-c-*-jisx0208.1983-0", 14 },
+	{ "-misc-fixed-medium-r-normal-ja-*",                    0 },
+	{ "-*-*-*-*-*-*-%u-*-*-*-*-*-iso10646-1",               14 }
+};
+
+/*
+ * ListFontsWithInfo で 1 件目を引く。
+ *
+ * ListFonts ではなく _with_info を使うのは、同時に返る FONTINFO
+ * (min_bounds/max_bounds, font_ascent/descent, min_byte1/max_byte1,
+ *  min/max_char_or_byte2, default_char) が §4.5.2 と §4.5.4 に必要だから。
+ * このリプライには per-char メトリクスの配列が含まれないので、
+ * §4.5.2 の QueryFont 禁止には抵触しない。
+ *
+ * 複数リプライ形式なので、name_len == 0 の終端リプライを読み切るまで
+ * 同じ cookie で reply を回し続けること（途中でやめると接続が詰まる）。
+ */
+static bool font_probe(const char *pattern, struct core_font *out)
+{
+	xcb_list_fonts_with_info_cookie_t ck;
+	xcb_list_fonts_with_info_reply_t *rep;
+	size_t plen;
+	bool got = false;
+
+	if (pattern == NULL || pattern[0] == '\0')
+		return false;
+	plen = strlen(pattern);
+	if (plen > 255)
+		return false;
+
+	memset(out, 0, sizeof(*out));
+
+	ck = xcb_list_fonts_with_info(wm.conn, 1, (uint16_t)plen, pattern);
+	for (;;) {
+		xcb_generic_error_t *err = NULL;
+		int nlen;
+		const char *nm;
+
+		rep = xcb_list_fonts_with_info_reply(wm.conn, ck, &err);
+		if (rep == NULL) {
+			free(err);
+			break;
+		}
+		if (rep->name_len == 0) {   /* 終端 */
+			free(rep);
+			break;
+		}
+		if (!got) {
+			nm   = xcb_list_fonts_with_info_name(rep);
+			nlen = xcb_list_fonts_with_info_name_length(rep);
+			if (nlen > 0 && nlen < (int)sizeof(out->name)) {
+				memcpy(out->name, nm, (size_t)nlen);
+				out->name[nlen] = '\0';
+
+				out->min_byte1     = rep->min_byte1;
+				out->max_byte1     = rep->max_byte1;
+				out->min_char      = rep->min_char_or_byte2;
+				out->max_char      = rep->max_char_or_byte2;
+				out->default_char  = rep->default_char;
+				out->ascent        = rep->font_ascent;
+				out->descent       = rep->font_descent;
+				out->max_width     = rep->max_bounds.character_width;
+				got = true;
+			}
+		}
+		free(rep);
+	}
+	return got;
+}
+
+/*
+ * OpenFont は必ず checked で発行する。
+ *
+ * xcb_open_font() は unchecked リクエストであり、存在しないフォント名を
+ * 渡してもその場では失敗せず、後続の描画で BadFont が非同期に返る。
+ * これが「起動はするが文字だけ出ない」「無関係な描画が壊れる」という
+ * 追いにくい不具合の正体になる (§4.5.1)。
+ */
+static bool font_open(struct core_font *f)
+{
+	xcb_void_cookie_t ck;
+	xcb_generic_error_t *err;
+	size_t nlen = strlen(f->name);
+
+	if (nlen == 0 || nlen > 255)
+		return false;
+
+	f->id = xcb_generate_id(wm.conn);
+	ck = xcb_open_font_checked(wm.conn, f->id, (uint16_t)nlen, f->name);
+	err = xcb_request_check(wm.conn, ck);
+	if (err != NULL) {
+		free(err);
+		f->id = XCB_NONE;
+		return false;
+	}
+	f->open = true;
+	return true;
+}
+
+static bool font_try_pattern(const char *pattern, struct core_font *f)
+{
+	if (!font_probe(pattern, f))
+		return false;
+	if (!font_open(f)) {
+		LOG("font: ListFontsWithInfo は当たったが OpenFont に失敗: %s",
+		    f->name);
+		return false;
+	}
+	return true;
+}
+
+static void font_expand(const struct font_cand *c, char *buf, size_t bufsz,
+                        uint8_t scale)
+{
+	if (c->px == 0)
+		strlcpy(buf, c->pat, bufsz);
+	else
+		snprintf(buf, bufsz, c->pat, (unsigned)(c->px * scale));
+}
+
+/*
+ * 8bit フォントに限り QueryFont で ASCII の幅表を写す (§4.5.2)。
+ * 16bit フォントでは絶対に呼ばない（禁止事項 (2)）。
+ * リプライは写し取ったら即座に free する。
+ */
+static void font_load_ascii_widths(const struct core_font *f)
+{
+	xcb_query_font_reply_t *rep;
+	const xcb_charinfo_t *ci;
+	int n, i;
+
+	g_have_ascii_w = false;
+	if (!f->open || f->max_byte1 != 0)
+		return;
+
+	rep = xcb_query_font_reply(wm.conn, xcb_query_font(wm.conn, f->id), NULL);
+	if (rep == NULL)
+		return;
+
+	ci = xcb_query_font_char_infos(rep);
+	n  = xcb_query_font_char_infos_length(rep);
+
+	for (i = 0; i < 95; i++) {
+		int code = 0x20 + i;
+		int idx  = code - (int)rep->min_char_or_byte2;
+		uint16_t w = (uint16_t)rep->max_bounds.character_width;
+
+		if (n > 0 && idx >= 0 && idx < n) {
+			const xcb_charinfo_t *g = &ci[idx];
+
+			/* 全メトリクスが 0 の CHARINFO は「その文字は存在しない」 */
+			if (g->character_width != 0 || g->left_side_bearing != 0 ||
+			    g->right_side_bearing != 0 || g->ascent != 0 ||
+			    g->descent != 0)
+				w = (uint16_t)g->character_width;
+		}
+		g_ascii_w[i] = w;
+	}
+	free(rep);
+	g_have_ascii_w = true;
+}
+
+/* 補助フォントを 1 つだけ開く (§4.5.4) */
+static void font_init_aux(void)
+{
+	size_t i;
+	char buf[256];
+
+	/* プライマリが CJK を範囲で覆っているなら補助は不要 */
+	if (cf_covers(&g_pri, 0x4E00u) && cf_covers(&g_pri, 0x3042u))
+		return;
+
+	for (i = 0; i < sizeof(g_aux_cands) / sizeof(g_aux_cands[0]); i++) {
+		struct core_font f;
+
+		font_expand(&g_aux_cands[i], buf, sizeof(buf), g_scale);
+		if (!font_try_pattern(buf, &f))
+			continue;
+		/* CJK を覆っていない補助フォントには意味が無い */
+		if (!cf_covers(&f, 0x4E00u)) {
+			xcb_close_font(wm.conn, f.id);
+			continue;
+		}
+		g_aux = f;
+		g_have_aux = true;
+		LOG("font: CJK 補助フォント: %s", g_aux.name);
+		return;
+	}
+	LOG("font: CJK 補助フォントは見つからなかった（該当文字は豆腐になる: §4.5.5）");
+}
+
+/* ================================================================== *
+ * §4.5.3 内蔵ビットマップフォント
+ * ================================================================== */
+
+static int bi_index(uint16_t c)
+{
+	if (c >= BI_FIRST && c <= 0xFFu)
+		return (int)c - BI_FIRST;
+	return BI_BOX;   /* 収録外は豆腐 */
+}
+
+/*
+ * アトラスの 1 ビットイメージを組み立ててサーバへ送る。
+ *
+ * XYBitmap の PutImage はサーバのビットマップ形式に従う必要がある:
+ *   - 各走査線は bitmap_format_scanline_pad ビットにパディング
+ *   - ユニット内のビット順は bitmap_format_bit_order
+ *   - ユニット (bitmap_format_scanline_unit ビット) 内のバイト並びは
+ *     image_byte_order
+ * まずビット順だけを見て「1 バイト = 8 ピクセル」で詰め、ユニットが
+ * 8bit を超えていてバイト順が食い違う場合にユニット内をバイト反転する。
+ */
+static bool bi_build_atlas(void)
+{
+	const xcb_setup_t *setup = xcb_get_setup(wm.conn);
+	uint16_t w = (uint16_t)(BI_GRID * g_cell_w);
+	uint16_t h = (uint16_t)(((BI_NGLYPH + BI_GRID - 1) / BI_GRID) * g_cell_h);
+	unsigned pad  = setup->bitmap_format_scanline_pad;
+	unsigned unit = setup->bitmap_format_scanline_unit;
+	unsigned lsb_bits = (setup->bitmap_format_bit_order ==
+	                     XCB_IMAGE_ORDER_LSB_FIRST);
+	unsigned lsb_bytes = (setup->image_byte_order == XCB_IMAGE_ORDER_LSB_FIRST);
+	size_t stride, total;
+	uint8_t *img;
+	xcb_gcontext_t gc1;
+	uint32_t gcv[2];
+	int i;
+
+	if (pad < 8) pad = 8;
+	if (unit < 8) unit = 8;
+
+	stride = (size_t)(((unsigned)w + pad - 1u) / pad) * pad / 8u;
+	total  = stride * (size_t)h;
+	img = calloc(1, total);
+	if (img == NULL)
+		return false;
+
+	for (i = 0; i < BI_NGLYPH; i++) {
+		int cx = (i % BI_GRID) * g_cell_w;
+		int cy = (i / BI_GRID) * g_cell_h;
+		int row, col, lo = BI_COLS, hi = -1;
+
+		/* インクの左右端を求める（プロポーショナル送り幅の算出） */
+		for (row = 0; row < BI_ROWS; row++) {
+			uint8_t bits = bi_glyphs[i][row];
+
+			for (col = 0; col < BI_COLS; col++) {
+				if (bits & (1u << (BI_COLS - 1 - col))) {
+					if (col < lo) lo = col;
+					if (col > hi) hi = col;
+				}
+			}
+		}
+		if (hi < 0) {   /* 空白 */
+			g_bi_trim[i] = 0;
+			g_bi_adv[i]  = (uint8_t)(BI_SPACE_W * g_scale);
+			continue;
+		}
+		g_bi_trim[i] = (uint8_t)lo;
+		g_bi_adv[i]  = (uint8_t)((hi - lo + 2) * g_scale);
+
+		/* 左トリムした状態でアトラスへ焼く（scale は最近傍で整数倍） */
+		for (row = 0; row < BI_ROWS; row++) {
+			uint8_t bits = bi_glyphs[i][row];
+
+			for (col = lo; col <= hi; col++) {
+				int sx, sy;
+
+				if (!(bits & (1u << (BI_COLS - 1 - col))))
+					continue;
+				for (sy = 0; sy < g_scale; sy++) {
+					int py = cy + row * g_scale + sy;
+					uint8_t *line = img + (size_t)py * stride;
+
+					for (sx = 0; sx < g_scale; sx++) {
+						int px = cx + (col - lo) * g_scale + sx;
+
+						if (lsb_bits)
+							line[px >> 3] |= (uint8_t)(1u << (px & 7));
+						else
+							line[px >> 3] |= (uint8_t)(0x80u >> (px & 7));
+					}
+				}
+			}
+		}
+	}
+
+	/* ユニット内のバイト並びを image_byte_order に合わせる */
+	if (unit > 8 && lsb_bits != lsb_bytes) {
+		size_t ub = unit / 8u;
+		size_t y;
+
+		for (y = 0; y < h; y++) {
+			uint8_t *line = img + y * stride;
+			size_t o;
+
+			for (o = 0; o + ub <= stride; o += ub) {
+				size_t k;
+
+				for (k = 0; k < ub / 2; k++) {
+					uint8_t t = line[o + k];
+
+					line[o + k] = line[o + ub - 1 - k];
+					line[o + ub - 1 - k] = t;
+				}
+			}
+		}
+	}
+
+	g_atlas = xcb_generate_id(wm.conn);
+	if (xcb_request_check(wm.conn,
+	        xcb_create_pixmap_checked(wm.conn, 1, g_atlas, wm.root, w, h)) != NULL) {
+		free(img);
+		g_atlas = XCB_NONE;
+		return false;
+	}
+
+	gc1 = xcb_generate_id(wm.conn);
+	gcv[0] = 1;   /* foreground: 1 ビットの側 */
+	gcv[1] = 0;   /* background */
+	xcb_create_gc(wm.conn, gc1, g_atlas,
+	              XCB_GC_FOREGROUND | XCB_GC_BACKGROUND, gcv);
+	xcb_put_image(wm.conn, XCB_IMAGE_FORMAT_XY_BITMAP, g_atlas, gc1,
+	              w, h, 0, 0, 0, 1, (uint32_t)total, img);
+	xcb_free_gc(wm.conn, gc1);
+	free(img);
+	return true;
+}
+
+static bool font_init_builtin(void)
+{
+	uint32_t v[2];
+
+	g_cell_w = (uint16_t)(BI_CELL_W * g_scale);
+	g_cell_h = (uint16_t)(BI_ROWS * g_scale);
+
+	if (!bi_build_atlas())
+		return false;
+
+	/*
+	 * 描画は CopyPlane ではなく「ステンシル (FillStippled) + 矩形塗り」で行う。
+	 *
+	 * SPEC §4.5.3 は CopyPlane と書いているが、深度 1 → 深度 N の CopyPlane は
+	 * 1 ビットを前景色、*0 ビットを背景色* で塗る。つまり ImageText16 と
+	 * まったく同じ「文字の背後に単色の箱が出る」問題を起こし、§4.5.4.1 で
+	 * ImageText16 を禁止した理由と正面から衝突する。
+	 * Stipple 塗りなら 1 のビットだけが前景色で塗られ、背景には触れない。
+	 * （§4.5.4.1 の要求が §4.5.3 の手段より優先する、という判断）
+	 */
+	v[0] = XCB_FILL_STYLE_STIPPLED;
+	v[1] = g_atlas;
+	xcb_change_gc(wm.conn, g_gc, XCB_GC_FILL_STYLE | XCB_GC_STIPPLE, v);
+
+	g_builtin = true;
+	g_ascent  = (uint16_t)(BI_ASCENT * g_scale);
+	g_descent = (uint16_t)((BI_ROWS - BI_ASCENT) * g_scale);
+	return true;
+}
+
+/* ================================================================== *
+ * 初期化 (§4.5.1)
+ * ================================================================== */
+
+bool font_init(const char *configured)
+{
+	uint32_t gcv[1];
+	size_t i;
+	char buf[256];
+
+	memset(&g_pri, 0, sizeof(g_pri));
+	memset(&g_aux, 0, sizeof(g_aux));
+	g_have_aux = false;
+	g_builtin  = false;
+	g_ready    = false;
+	g_ellipsis_w = -1;
+	g_scale = font_scale();
+
+	if (g_gc == XCB_NONE) {
+		g_gc = xcb_generate_id(wm.conn);
+		gcv[0] = 0;   /* graphics_exposures */
+		xcb_create_gc(wm.conn, g_gc, wm.root, XCB_GC_GRAPHICS_EXPOSURES, gcv);
+	}
+	g_gc_font = XCB_NONE;
+	g_gc_fg   = 0xFFFFFFFFu;
+
+	/* 候補 1: 設定ファイルの font。失敗しても警告だけ出して続ける */
+	if (configured != NULL && configured[0] != '\0') {
+		if (font_try_pattern(configured, &g_pri))
+			goto adopted;
+		ERR("font: 設定の font \"%s\" を開けなかった。既定の候補列で続行する",
+		    configured);
+	}
+
+	/* 候補 2..8 */
+	for (i = 0; i < sizeof(g_cands) / sizeof(g_cands[0]); i++) {
+		font_expand(&g_cands[i], buf, sizeof(buf), g_scale);
+		if (font_try_pattern(buf, &g_pri))
+			goto adopted;
+	}
+
+	/* 候補 9: 内蔵フォント (§4.5.3)。ここに落ちても起動は続ける */
+	if (font_init_builtin()) {
+		snprintf(g_desc, sizeof(g_desc),
+		         "builtin %dx%d bitmap (ASCII + Latin-1, %d glyphs, scale %u)",
+		         BI_COLS, BI_ROWS, BI_NGLYPH, (unsigned)g_scale);
+		LOG("font: 採用 = %s", g_desc);
+		/*
+		 * §4.5.3 / §4.5.5: 一度だけ警告する。
+		 * 内蔵フォントは Latin-1 までなので、日本語等のタイトルは豆腐になる。
+		 */
+		ERR("使えるコアフォントが 1 つも見つからなかった。"
+		    "内蔵ビットマップフォントで起動する。");
+		ERR("ASCII / Latin-1 以外のタイトルは □ になる。"
+		    "フォントパッケージ (例: font-misc-misc) を入れるか、"
+		    "XFT=1 でビルドしたものを使うこと。");
+		g_ready = true;
+		(void)ellipsis_width();
+		return true;
+	}
+
+	ERR("フォントの初期化に完全に失敗した。文字は描画されないが起動は続ける。");
+	strlcpy(g_desc, "none", sizeof(g_desc));
+	return false;
+
+adopted:
+	g_ascent  = (uint16_t)(g_pri.ascent  > 0 ? g_pri.ascent  : 0);
+	g_descent = (uint16_t)(g_pri.descent > 0 ? g_pri.descent : 0);
+	if (g_ascent + g_descent == 0) {  /* 病的な FONTINFO への保険 */
+		g_ascent  = (uint16_t)(BI_ASCENT * g_scale);
+		g_descent = (uint16_t)((BI_ROWS - BI_ASCENT) * g_scale);
+	}
+	LOG("font: 採用 = %s (%s, ascent %d, descent %d)", g_pri.name,
+	    g_pri.max_byte1 == 0 ? "8bit" : "16bit",
+	    (int)g_pri.ascent, (int)g_pri.descent);
+
+	font_load_ascii_widths(&g_pri);
+	font_init_aux();
+
+	/*
+	 * §4.5.4: ベースラインは「両フォントの font_ascent の大きい方」に揃える。
+	 * 補助フォント（多くは 13-14px の等幅）はプライマリ（11px）より背が高い
+	 * ことが普通で、プライマリの ascent だけで行を組むと CJK のランが
+	 * キャプション上端をはみ出す。descent も同様に大きい方を採る。
+	 */
+	if (g_have_aux) {
+		if (g_aux.ascent > 0 && (uint16_t)g_aux.ascent > g_ascent)
+			g_ascent = (uint16_t)g_aux.ascent;
+		if (g_aux.descent > 0 && (uint16_t)g_aux.descent > g_descent)
+			g_descent = (uint16_t)g_aux.descent;
+	}
+
+	snprintf(g_desc, sizeof(g_desc), "%s (%s, ascent %u, descent %u%s%s)",
+	         g_pri.name,
+	         g_pri.max_byte1 == 0 ? "8bit" : "16bit",
+	         (unsigned)g_ascent, (unsigned)g_descent,
+	         g_have_aux ? " + aux " : "",
+	         g_have_aux ? g_aux.name : "");
+	g_ready = true;
+
+	/*
+	 * "..." の幅はここで一度だけ測っておく (§4.5.2)。
+	 * こうしておくと font_measure_fit() の往復は「全体の幅 1 回 +
+	 * 切り詰め位置の追試 2 回」に厳密に収まる。初期化は描画経路ではない。
+	 */
+	(void)ellipsis_width();
+	return true;
+}
+
+void font_fini(void)
+{
+	if (g_pri.open)
+		xcb_close_font(wm.conn, g_pri.id);
+	if (g_have_aux && g_aux.open)
+		xcb_close_font(wm.conn, g_aux.id);
+	if (g_atlas != XCB_NONE)
+		xcb_free_pixmap(wm.conn, g_atlas);
+	if (g_gc != XCB_NONE)
+		xcb_free_gc(wm.conn, g_gc);
+
+	g_pri.open = false;
+	g_aux.open = false;
+	g_have_aux = false;
+	g_atlas = XCB_NONE;
+	g_gc = XCB_NONE;
+	g_builtin = false;
+	g_ready = false;
+}
+
+const char *font_describe(void)
+{
+	return g_desc[0] != '\0' ? g_desc : "none";
+}
+
+uint16_t font_ascent(void)
+{
+	return g_ascent;
+}
+
+uint16_t font_height(void)
+{
+	return (uint16_t)(g_ascent + g_descent);
+}
+
+/* ================================================================== *
+ * §4.5.2 計測
+ *
+ * ここから下の 2 つの公開関数 (font_text_width / font_measure_fit) だけが
+ * ラウンドトリップを許されている。描画経路 (Expose ハンドラ, deco_draw)
+ * から呼んではならない。理由は冒頭の禁止事項 (3) を参照。
+ * ================================================================== */
+
+/* 全部 ASCII なら幅表だけで往復ゼロで測れる */
+static bool ucs2_all_ascii(const uint16_t *s, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		if (s[i] < 0x20u || s[i] > 0x7Eu)
+			return false;
+	return true;
+}
+
+static uint32_t builtin_width(const uint16_t *s, size_t n)
+{
+	uint32_t w = 0;
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		w += g_bi_adv[bi_index(s[i])];
+	return w;
+}
+
+static uint32_t ascii_table_width(const uint16_t *s, size_t n)
+{
+	uint32_t w = 0;
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		w += g_ascii_w[s[i] - 0x20u];
+	return w;
+}
+
+/*
+ * ラン単位で QueryTextExtents を投げる。
+ * cookie を全部先に発行してから reply を読むので、ラン数によらず
+ * ラウンドトリップは 1 回で済む。
+ */
+static uint32_t query_runs_width(const uint16_t *s, size_t n)
+{
+	xcb_query_text_extents_cookie_t ck[FONT_MAX_RUNS];
+	xcb_char2b_t chars[FONT_MAX_GLYPHS];
+	size_t i, nrun = 0;
+	uint32_t total = 0;
+
+	if (n == 0)
+		return 0;
+
+	for (i = 0; i < n; i++) {
+		chars[i].byte1 = (uint8_t)(s[i] >> 8);
+		chars[i].byte2 = (uint8_t)(s[i] & 0xFFu);
+	}
+
+	i = 0;
+	while (i < n && nrun < FONT_MAX_RUNS) {
+		xcb_font_t f = font_for(s[i]);
+		size_t j = i + 1;
+
+		/* 最後のランは残り全部を飲み込む（ラン数の上限対策） */
+		if (nrun + 1 == FONT_MAX_RUNS)
+			j = n;
+		else
+			while (j < n && font_for(s[j]) == f)
+				j++;
+
+		ck[nrun++] = xcb_query_text_extents(wm.conn, f,
+		                                    (uint32_t)(j - i), &chars[i]);
+		i = j;
+	}
+
+	for (i = 0; i < nrun; i++) {
+		xcb_query_text_extents_reply_t *rep;
+
+		rep = xcb_query_text_extents_reply(wm.conn, ck[i], NULL);
+		if (rep == NULL) {
+			/* 失敗したランは max_bounds から見積もる（安全側に大きく） */
+			total += (uint32_t)(g_pri.max_width > 0 ? g_pri.max_width : 1);
+			continue;
+		}
+		if (rep->overall_width > 0)
+			total += (uint32_t)rep->overall_width;
+		free(rep);
+	}
+	return total;
+}
+
+/* UCS-2 列の幅。ラウンドトリップは最大 1 回 */
+static uint32_t ucs2_width(const uint16_t *s, size_t n)
+{
+	if (n == 0)
+		return 0;
+	if (g_builtin)
+		return builtin_width(s, n);
+	if (!g_ready)
+		return 0;
+	if (g_have_ascii_w && ucs2_all_ascii(s, n))
+		return ascii_table_width(s, n);
+	return query_runs_width(s, n);
+}
+
+static uint32_t ellipsis_width(void)
+{
+	static const uint16_t dots[3] = { '.', '.', '.' };
+
+	if (g_ellipsis_w < 0)
+		g_ellipsis_w = (int32_t)ucs2_width(dots, 3);
+	return (uint32_t)g_ellipsis_w;
+}
+
+uint16_t font_text_width(const char *utf8, size_t len)
+{
+	uint16_t ucs[FONT_MAX_GLYPHS];
+	size_t n;
+	uint32_t w;
+
+	n = font_to_ucs2(utf8, len, ucs);
+	w = ucs2_width(ucs, n);
+	return (uint16_t)(w > 0xFFFFu ? 0xFFFFu : w);
+}
+
+/*
+ * avail に収まるグリフ数と省略記号の有無を返す (§4.5.2.1)。
+ *
+ * 二分探索で何度も往復しない。max_bounds.character_width から
+ * 「確実に収まる個数」を見積もり、追加の往復は最大 2 回に制限する
+ * （1 回目で実測 → 比例で伸ばして 2 回目 → 超えていたら 1 回目の値へ切り詰め）。
+ * 内蔵フォントと ASCII 幅表がある場合は往復ゼロで厳密に求まる。
+ */
+void font_measure_fit(const char *utf8, size_t len, uint16_t avail,
+                      uint8_t *glyphs, uint8_t *ellipsis)
+{
+	uint16_t ucs[FONT_MAX_GLYPHS];
+	size_t n;
+	uint32_t total, ell, budget;
+	uint32_t k1, k2, w1, w2;
+
+	if (glyphs != NULL)   *glyphs = 0;
+	if (ellipsis != NULL) *ellipsis = 0;
+	if (glyphs == NULL || !g_ready)
+		return;
+
+	n = font_to_ucs2(utf8, len, ucs);
+	if (n > 255)               /* draw_glyphs は uint8_t (§4.5.2.1) */
+		n = 255;
+	if (n == 0)
+		return;
+
+	total = ucs2_width(ucs, n);            /* 往復 0 or 1 回 */
+	if (total <= avail) {
+		*glyphs = (uint8_t)n;
+		return;
+	}
+
+	ell = ellipsis_width();
+	if (avail <= ell) {
+		/* 省略記号すら入らない。何も描かない方が崩れない */
+		return;
+	}
+	budget = (uint32_t)avail - ell;
+
+	/* 往復ゼロで厳密に求まる経路 */
+	if (g_builtin || (g_have_ascii_w && ucs2_all_ascii(ucs, n))) {
+		uint32_t acc = 0;
+		size_t i;
+
+		for (i = 0; i < n; i++) {
+			uint32_t cw = g_builtin ? g_bi_adv[bi_index(ucs[i])]
+			                        : g_ascii_w[ucs[i] - 0x20u];
+
+			if (acc + cw > budget)
+				break;
+			acc += cw;
+		}
+		*glyphs = (uint8_t)i;
+		if (ellipsis != NULL)
+			*ellipsis = 1;
+		return;
+	}
+
+	/* --- ここから 16bit フォント: 追加の往復は最大 2 回 --- */
+	{
+		uint32_t maxw = (uint32_t)(g_pri.max_width > 0 ? g_pri.max_width : 1);
+
+		k1 = budget / maxw;    /* 各文字が最大幅でもこの個数は必ず収まる */
+	}
+	if (k1 == 0) {
+		if (ellipsis != NULL)
+			*ellipsis = 1;
+		return;                /* グリフ 0 個 + "..." */
+	}
+	if (k1 >= n)
+		k1 = (uint32_t)n - 1;
+
+	w1 = ucs2_width(ucs, k1);              /* 追加の往復 1 回目 */
+	k2 = k1;
+	if (w1 > 0 && w1 < budget) {
+		uint32_t est = (uint32_t)((uint64_t)k1 * budget / w1);
+
+		if (est > k1)
+			k2 = est;
+	}
+	if (k2 >= n)
+		k2 = (uint32_t)n - 1;
+
+	if (k2 > k1) {
+		w2 = ucs2_width(ucs, k2);          /* 追加の往復 2 回目 */
+		if (w2 > budget)
+			k2 = k1;                       /* これ以上は測らず安全側へ */
+	}
+
+	*glyphs = (uint8_t)k2;
+	if (ellipsis != NULL)
+		*ellipsis = 1;
+}
+
+/* ================================================================== *
+ * §4.5.4.1 描画
+ *
+ * ここは描画経路である。リプライを伴うリクエストを 1 つも出してはならない
+ * (§3.4.1, §4.5.2.1)。以下で使うのは xcb_change_gc / xcb_poly_text_16 /
+ * xcb_poly_fill_rectangle だけで、いずれも unchecked かつ非同期である。
+ * ================================================================== */
+
+static void font_set_fg(uint32_t color)
+{
+	uint32_t v[1];
+
+	if (g_gc_fg == color)
+		return;
+	v[0] = color;
+	xcb_change_gc(wm.conn, g_gc, XCB_GC_FOREGROUND, v);
+	g_gc_fg = color;
+}
+
+/*
+ * PolyText16 のアイテム列を組み立てる (§4.5.4.1)。
+ *
+ * テキストアイテム : [len:1][delta:int8][chars: len*2 バイト]
+ *                     chars は CHAR2B すなわち上位バイト先行 (big-endian)。
+ *                     len の上限は 254。
+ * フォント切替     : [255][id>>24][id>>16][id>>8][id]
+ *                     255 は「次の 4 バイトはフォント ID」という標識で、
+ *                     ID は *最上位バイト先行* で置く（リトルエンディアン
+ *                     マシンでそのままメモリコピーすると壊れる）。
+ *
+ * delta は「直前のアイテムの終端からの水平移動量」で符号付き 1 バイト。
+ * ここではランを隙間なく並べるので常に 0。
+ *
+ * 【副作用への対処】フォント切替アイテムを含む PolyText16 は GC の font
+ * 属性を変更したままにする。本実装は「font.c 専用の GC を 1 つ持ち、
+ * 現在の font を g_gc_font で追跡して、必要なときだけ明示的に設定し直す」
+ * 方式を採る（= 復元ではなく明示設定）。GC は他のモジュールと共有しない
+ * ので、draw.c / deco.c 側の描画が巻き添えになることはない。
+ */
+static size_t polytext_build(const uint16_t *s, size_t n, xcb_font_t *last_font)
+{
+	size_t pos = 0;
+	size_t i = 0;
+	xcb_font_t cur = g_gc_font;
+
+	while (i < n) {
+		xcb_font_t f = font_for(s[i]);
+		size_t j = i;
+		size_t cnt, k;
+
+		while (j < n && font_for(s[j]) == f && (j - i) < POLYTEXT_MAX_ITEM)
+			j++;
+		cnt = j - i;
+
+		if (f != cur) {
+			if (pos + 5 > sizeof(g_items))
+				break;
+			g_items[pos++] = 255;                     /* フォント切替の標識 */
+			g_items[pos++] = (uint8_t)(f >> 24);      /* 最上位バイト先行 */
+			g_items[pos++] = (uint8_t)(f >> 16);
+			g_items[pos++] = (uint8_t)(f >> 8);
+			g_items[pos++] = (uint8_t)(f);
+			cur = f;
+		}
+		if (pos + 2 + cnt * 2 > sizeof(g_items))
+			break;
+		g_items[pos++] = (uint8_t)cnt;
+		g_items[pos++] = 0;                           /* delta */
+		for (k = 0; k < cnt; k++) {
+			g_items[pos++] = (uint8_t)(s[i + k] >> 8);
+			g_items[pos++] = (uint8_t)(s[i + k] & 0xFFu);
+		}
+		i = j;
+	}
+	*last_font = cur;
+	return pos;
+}
+
+static void font_draw_core(xcb_drawable_t d, int16_t x, int16_t y,
+                           const uint16_t *s, size_t n)
+{
+	size_t nitems;
+	xcb_font_t last = g_gc_font;
+
+	/*
+	 * 最初のランのフォントが GC の現在値と違えば、アイテム列の先頭に
+	 * 切替が入る（polytext_build が面倒を見る）。GC 側の font を先に
+	 * 合わせておく必要があるのは「GC に一度も font を設定していない」
+	 * 場合だけで、その場合は cur == XCB_NONE なので必ず切替が入る。
+	 */
+	nitems = polytext_build(s, n, &last);
+	if (nitems == 0)
+		return;
+
+	/* ImageText16 ではなく PolyText16 (§4.5.4.1)。背景には触れない */
+	xcb_poly_text_16(wm.conn, d, g_gc, x, y, (uint32_t)nitems, g_items);
+
+	/* サーバ側の GC は最後に使ったフォントのままになる。追跡しておく */
+	g_gc_font = last;
+}
+
+/*
+ * 内蔵フォントの描画。
+ * GC には起動時に stipple = アトラス / fill_style = Stippled を設定済み。
+ * グリフごとに tile-stipple origin をずらして 1 セル分の矩形を塗る。
+ * 0 のビットには触れないので、グラデーションの上でも背景が壊れない。
+ */
+static void font_draw_builtin(xcb_drawable_t d, int16_t x, int16_t y,
+                              const uint16_t *s, size_t n)
+{
+	int16_t pen = x;
+	int16_t top = (int16_t)(y - (int16_t)g_ascent);
+	size_t i;
+
+	if (g_atlas == XCB_NONE)
+		return;
+
+	for (i = 0; i < n; i++) {
+		int idx = bi_index(s[i]);
+		uint8_t adv = g_bi_adv[idx];
+		int cx = (idx % BI_GRID) * g_cell_w;
+		int cy = (idx / BI_GRID) * g_cell_h;
+		uint32_t v[2];
+		xcb_rectangle_t r;
+
+		if (adv == 0)
+			continue;
+		v[0] = (uint32_t)(int32_t)(pen - cx);
+		v[1] = (uint32_t)(int32_t)(top - cy);
+		xcb_change_gc(wm.conn, g_gc,
+		              XCB_GC_TILE_STIPPLE_ORIGIN_X |
+		              XCB_GC_TILE_STIPPLE_ORIGIN_Y, v);
+
+		r.x = pen;
+		r.y = top;
+		r.width  = adv;
+		r.height = g_cell_h;
+		xcb_poly_fill_rectangle(wm.conn, d, g_gc, 1, &r);
+
+		pen = (int16_t)(pen + adv);
+	}
+}
+
+/*
+ * y はベースライン座標（PolyText16 の y と同じ意味）。
+ * 呼び出し側は「描画領域の上端 + font_ascent()」を渡すこと。
+ * 背景には触れない。必要なら呼び出し側が先に塗っておく (§4.5.4.1)。
+ */
+void font_draw(xcb_drawable_t d, int16_t x, int16_t y,
+               const char *utf8, size_t len, uint32_t color)
+{
+	uint16_t ucs[FONT_MAX_GLYPHS];
+	size_t n;
+
+	if (!g_ready || d == XCB_NONE)
+		return;
+
+	n = font_to_ucs2(utf8, len, ucs);
+	if (n == 0)
+		return;
+
+	font_set_fg(color);
+
+	if (g_builtin)
+		font_draw_builtin(d, x, y, ucs, n);
+	else
+		font_draw_core(d, x, y, ucs, n);
+}

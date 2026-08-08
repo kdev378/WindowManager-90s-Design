@@ -25,7 +25,7 @@ core ビルドでの日本語タイトル表示は、環境にある X コアフ
 
 ## 状態
 
-**Phase 1 完了** — コア WM が動作します。装飾描画は Phase 2 から。
+**Phase 2 完了** — Windows 98 の外観で動作します。
 
 ```
 make          # ビルド (依存: libxcb, xcb-randr, xcb-sync, xcb-keysyms)
@@ -33,17 +33,20 @@ make test     # Xvfb 上で結合テスト
 make memcheck # メモリ実測 (SPEC §9.1)
 ```
 
-現時点で動くもの: ウィンドウの管理・reparent、ICCCM/EWMH の主要プロパティ、
+現時点で動くもの: Win98 の枠・タイトルバー・キャプションボタン・ウィンドウメニュー・
+カーソル、ウィンドウの管理・reparent、ICCCM/EWMH の主要プロパティ、
 フォーカス（ICCCM の 4 入力モデル）、移動・リサイズ（レート制御付き）、
 スタッキング、キーバインド、複数デスクトップ、マルチモニタ (RandR)。
 
+タスクバー・スタートメニュー・システムトレイは Phase 4 です。
+
 | 指標 | 実測 | 目標 |
 | --- | --- | --- |
-| Private_Dirty (0 窓) | 232 KB | < 400 KB |
-| Private_Dirty (20 窓) | 252 KB | < 1024 KB |
+| Private_Dirty (0 窓) | 236 KB | < 400 KB |
+| Private_Dirty (20 窓) | 260 KB | < 1024 KB |
 | 窓あたりの限界費用 | 約 1.2 KB | < 2 KB |
 
-詳細と読み方は [docs/MEMORY.md](docs/MEMORY.md)。装飾・タスクバーが未実装の
+詳細と読み方は [docs/MEMORY.md](docs/MEMORY.md)。タスクバー・トレイが未実装の
 段階の数字であり、最終的な達成を保証するものではありません。
 
 名称は実装が動いてから決めるため、現在の `w98wm` は仮称です（SPEC §11.1）。

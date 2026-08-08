@@ -46,7 +46,8 @@ jobs:
             libxcb-keysyms1-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             xvfb xterm xdotool wmctrl x11-utils \
             valgrind \
-            xfonts-base xbitmaps
+            xfonts-base xbitmaps \
+            imagemagick
 
       - name: ビルド (${{ matrix.cc }}, core プロファイル)
         run: make CC=${{ matrix.cc }}
@@ -77,6 +78,48 @@ jobs:
         if: github.event_name == 'schedule'
         run: sh tools/memcheck.sh --long --json
 
+      # --- Phase 2 (Win98 外観) の目視確認用スクリーンショット ---
+      # deco.c 等が未実装/未着手でも tools/screenshot.sh 自体は動く
+      # (装飾なしの素のフレームが写るだけ)。ベストエフォートなので
+      # 失敗してもジョブ全体は失敗させない (continue-on-error)。
+      - name: "Phase 2 スクリーンショット取得 (目視確認用)"
+        if: always()
+        continue-on-error: true
+        run: sh tools/screenshot.sh --out /tmp/w98wm-shot-${{ matrix.cc }}.png --clients 2
+
+      - name: "スクリーンショットのアップロード"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: w98wm-screenshot-${{ matrix.cc }}
+          path: /tmp/w98wm-shot-${{ matrix.cc }}.png
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # --- 基準画像 (SPEC §4.0) との pixdiff ---
+      # tests/reference/ に基準スクリーンショットが置かれるのは Phase 2 完了
+      # 条件 (PLAN.md) 達成後なので、それまでは存在確認して静かにスキップする。
+      - name: "基準画像との pixdiff (tests/reference/ がある場合のみ)"
+        if: always()
+        continue-on-error: true
+        run: |
+          REF="tests/reference/default.png"
+          if [ -f "$REF" ] && [ -f "/tmp/w98wm-shot-${{ matrix.cc }}.png" ]; then
+            sh tools/pixdiff.sh --ref "$REF" --in "/tmp/w98wm-shot-${{ matrix.cc }}.png" \
+              --out "/tmp/w98wm-pixdiff-${{ matrix.cc }}.png"
+          else
+            echo "基準画像 ($REF) が無いため pixdiff をスキップします (Phase 2 完了条件未達)"
+          fi
+
+      - name: "pixdiff 差分画像のアップロード"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: w98wm-pixdiff-${{ matrix.cc }}
+          path: /tmp/w98wm-pixdiff-${{ matrix.cc }}.png
+          if-no-files-found: ignore
+          retention-days: 14
+
   build-musl:
     name: build-musl (Alpine)
     runs-on: ubuntu-latest
@@ -93,7 +136,8 @@ jobs:
             libxcb-dev xcb-util-keysyms-dev \
             xvfb xterm xdotool wmctrl \
             valgrind \
-            font-misc-misc
+            font-misc-misc \
+            xprop xwininfo xwd imagemagick
 
       - name: ビルド (Alpine ネイティブ = musl)
         run: make

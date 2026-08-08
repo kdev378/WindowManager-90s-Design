@@ -345,6 +345,15 @@ bool wm_init(int argc, char **argv)
 	LOG("フォント: %s", font_describe());
 	cursor_init();
 
+	/*
+	 * デスクトップ背景 (SPEC §4.1 の THEME_DESKTOP、既定はティール)。
+	 * 画像は扱わない——デコーダを持たない方針なので、壁紙が要る場合は
+	 * xsetroot/feh に任せる (PLAN Phase 2-9)。
+	 */
+	vals[0] = wm.cfg.color[THEME_DESKTOP];
+	xcb_change_window_attributes(wm.conn, wm.root, XCB_CW_BACK_PIXEL, vals);
+	xcb_clear_area(wm.conn, 0, wm.root, 0, 0, 0, 0);
+
 	input_init();
 	focus_none();
 

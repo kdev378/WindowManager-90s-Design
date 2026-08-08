@@ -138,7 +138,12 @@ get_parent_window() {
 		echo ""
 		return 1
 	}
-	xwininfo -display "$DISPLAY" -id "$1" 2>/dev/null | awk '/Parent window id:/ { print $4; exit }'
+	# -children (または -tree) を付けないと "Parent window id:" 行が出ない。
+	# 付け忘れると常に空文字を返し、呼び出し側の reparent 検証が
+	# 「確認できないので代替へ」の分岐に落ちて**素通り**する。
+	# テストが緑のまま中身を検査していない状態になるので注意。
+	xwininfo -display "$DISPLAY" -id "$1" -children 2>/dev/null |
+		awk '/Parent window id:/ { print $4; exit }'
 }
 
 # hex表示 <10進のウィンドウID> : xdotool の10進出力を xprop/wmctrl 用の0x...表記に変換する

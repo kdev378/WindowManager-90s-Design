@@ -386,21 +386,62 @@ static void on_motion(xcb_motion_notify_event_t *e)
 		deco_draw(c, NULL);           /* 押下表示の付け外し */
 }
 
+/*
+ * Expose (SPEC §4.4)
+ *
+ * X サーバは 1 つの損傷領域を**複数の矩形に分割して**送り、count は
+ * 「この損傷に対する残りのイベント数」を表す。したがって count==0 の
+ * 1 通だけを描くと、それ以前の矩形が描かれないまま失われる
+ * （実際に、最初のマップでキャプションが描かれない不具合になった）。
+ *
+ * 正しくは、count が 0 になるまで矩形の外接矩形を貯め、
+ * 揃った時点で 1 回だけ描く。ドラッグ中の再描画量も抑えられる。
+ */
 static void on_expose(xcb_expose_event_t *e)
 {
-	struct client *c = client_find_by_frame(e->window);
+	static xcb_window_t acc_win;
+	static int32_t x0, y0, x1, y1;
+	static bool acc_valid;
+	struct client *c;
 	xcb_rectangle_t clip;
 
+	if (acc_valid && acc_win != e->window) {
+		/* 別ウィンドウの Expose が割り込んだ。貯めていた分を先に描く */
+		struct client *prev = client_find_by_frame(acc_win);
+		if (prev && (prev->flags & CF_DECORATED)) {
+			clip.x = (int16_t)x0;
+			clip.y = (int16_t)y0;
+			clip.width  = (uint16_t)(x1 - x0);
+			clip.height = (uint16_t)(y1 - y0);
+			deco_draw(prev, &clip);
+		}
+		acc_valid = false;
+	}
+
+	if (!acc_valid) {
+		acc_win = e->window;
+		x0 = e->x;                 y0 = e->y;
+		x1 = e->x + e->width;      y1 = e->y + e->height;
+		acc_valid = true;
+	} else {
+		if (e->x < x0) x0 = e->x;
+		if (e->y < y0) y0 = e->y;
+		if (e->x + e->width  > x1) x1 = e->x + e->width;
+		if (e->y + e->height > y1) y1 = e->y + e->height;
+	}
+
+	if (e->count != 0)
+		return;                    /* まだ続く。貯めるだけ */
+
+	acc_valid = false;
+	c = client_find_by_frame(e->window);
 	if (!c || !(c->flags & CF_DECORATED))
 		return;
-	/* 連続する Expose の最後だけ描く（count は残数） */
-	if (e->count != 0)
-		return;
 
-	clip.x = (int16_t)e->x;
-	clip.y = (int16_t)e->y;
-	clip.width = e->width;
-	clip.height = e->height;
+	clip.x = (int16_t)x0;
+	clip.y = (int16_t)y0;
+	clip.width  = (uint16_t)(x1 - x0);
+	clip.height = (uint16_t)(y1 - y0);
 	deco_draw(c, &clip);
 }
 

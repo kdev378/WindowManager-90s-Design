@@ -233,6 +233,15 @@ void config_defaults(struct config *cfg)
 	        "-*-helvetica-medium-r-normal--11-*-*-*-p-*-iso10646-1");
 	cfg->scale = 1;
 
+	/*
+	 * 既定パレット (SPEC §4.1)。
+	 * 「配色の中身は theme.c、既定値の設定は config.c」という分担。
+	 * ここを空けたまま theme.c 側も触らないと、全色が 0 = 黒になり
+	 * 装飾が一切見えなくなる（実際に一度そうなった）。
+	 */
+	cfg->theme_preset = THEME_PRESET_STANDARD;
+	theme_load_preset(cfg->color, THEME_PRESET_STANDARD);
+
 	/* ---- 挙動 ---- */
 	cfg->focus_mode       = FOCUS_CLICK;
 	cfg->focus_raise      = true;
@@ -410,18 +419,23 @@ static void apply_key(struct config *cfg, const char *key, char *value)
 	long n;
 
 	if (strcmp(key, "theme") == 0) {
-		static const char *const themes[] = {
-			"standard", "rainy", "eggplant", "plum", "hicontrast", "custom"
-		};
-		bool ok = false;
-		for (size_t i = 0; i < sizeof(themes) / sizeof(themes[0]); i++) {
-			if (strcmp(value, themes[i]) == 0) {
-				ok = true;
-				break;
-			}
-		}
-		if (!ok)
+		int idx;
+
+		/*
+		 * "custom" は「プリセットを読み込まず color.* の指定に任せる」の意。
+		 * それ以外はプリセットを読み込む。この行より後の color.* は
+		 * プリセットの上に重なる（INI として自然な順序依存）。
+		 */
+		if (strcmp(value, "custom") == 0)
+			return;
+		idx = theme_preset_index(value);
+		if (idx < 0) {
 			ERR("config: theme の値が不正です: '%s'", value);
+			return;
+		}
+		cfg->theme_preset = (uint8_t)idx;
+		theme_load_preset(cfg->color, idx);
+		return;
 		/* struct config には theme 名を保持するフィールドが無い
 		 * (theme.c 未実装、Phase 2 待ち)。値の妥当性検証のみ行い、
 		 * 格納は行わない。header 側にフィールドが追加され次第対応する。 */
