@@ -183,14 +183,6 @@ static void update_fixed_size(struct client *c)
 		c->flags |= CF_FIXED_SIZE;
 }
 
-/* このクライアントを今マップしてよいか（デスクトップの表示面か） (§3.8) */
-static bool client_on_current_desktop(const struct client *c)
-{
-	return c->desktop == WM_ALL_DESKTOPS ||
-	       (c->states & ST_STICKY) != 0 ||
-	       c->desktop == wm.current_desktop;
-}
-
 /* ================================================================== *
  * 装飾の判定 (SPEC §3.2)
  * ================================================================== */
@@ -572,6 +564,13 @@ struct client *client_manage(xcb_window_t win, bool adopting)
 	}
 	if (c->states & ST_STICKY)
 		c->desktop = WM_ALL_DESKTOPS;
+	/* 自分で設定していないクライアントのために WM 側から公開しておく。
+	 * client_set_desktop() は frame の map/unmap まで行うため、まだ map して
+	 * いないこの時点では使わず、プロパティだけ書く。 */
+	vals[0] = c->desktop;
+	xcb_change_property(wm.conn, XCB_PROP_MODE_REPLACE, c->win,
+	                    atoms[ATOM_NET_WM_DESKTOP], XCB_ATOM_CARDINAL, 32,
+	                    1, vals);
 
 	c->layer = base_layer(c);
 
@@ -607,7 +606,7 @@ struct client *client_manage(xcb_window_t win, bool adopting)
 		c->states |= ST_HIDDEN;
 		client_set_state(c, WM_STATE_ICONIC);
 		/* frame も win もマップしない。既に unmapped なので unmap も不要 */
-	} else if (client_on_current_desktop(c)) {
+	} else if (client_visible_on(c, wm.current_desktop)) {
 		xcb_map_window(wm.conn, c->win);
 		xcb_map_window(wm.conn, c->frame);
 		c->flags |= CF_MAPPED;
@@ -760,8 +759,14 @@ void client_iconify(struct client *c)
 	 * WM 起因の UnmapNotify を無視するカウンタ (§3.8 の発生源 2)。
 	 * 加算は必ず UnmapWindow の「前」。後にすると、サーバからのイベントが
 	 * 先に読まれた場合に本物の withdraw と区別できなくなる。
-	 * 数えるのはクライアントウィンドウ宛の 1 件だけ。frame の UnmapNotify は
-	 * ウィンドウ ID が違うので混ざらない。
+	 *
+	 * ★ カウンタの単位は「クライアントウィンドウ (c->win) 宛の UnmapNotify」
+	 * ちょうど 1 件である。減算するのは event.c の on_unmap_notify() だけで、
+	 * そこは e->window != c->win のイベントを数える前に捨てている。
+	 * したがって frame だけを unmap する経路で加算してはならない
+	 * （frame の UnmapNotify は永久に減算されず、次の本物の withdraw を
+	 * 食い潰してウィンドウが画面に残る）。逆に c->win を unmap する経路では
+	 * 必ず加算する。ここで両方 unmap しているので加算は 1 回だけ。
 	 */
 	c->unmap_pending++;
 	xcb_unmap_window(wm.conn, c->win);
@@ -794,7 +799,7 @@ void client_deiconify(struct client *c)
 
 	/* 別デスクトップにあるウィンドウを復帰させても、そこは表示面ではない (§3.8)。
 	 * WM_STATE だけ Normal に戻し、map は切替時に行う。 */
-	if (client_on_current_desktop(c)) {
+	if (client_visible_on(c, wm.current_desktop)) {
 		xcb_map_window(wm.conn, c->win);
 		xcb_map_window(wm.conn, c->frame);
 		c->flags |= CF_MAPPED;

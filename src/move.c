@@ -135,8 +135,7 @@ static bool snap_candidate(const struct client *o)
 	if (o->states & (ST_HIDDEN | ST_FULLSCREEN)) return false;
 	/* デスクトップ型は画面全体を覆う。作業領域の候補と重複するだけなので除く */
 	if (o->type == TYPE_DESKTOP)           return false;
-	if (o->desktop != WM_ALL_DESKTOPS && o->desktop != wm.current_desktop)
-		return false;
+	if (!client_visible_on(o, wm.current_desktop)) return false;
 	return true;
 }
 
