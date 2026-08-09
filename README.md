@@ -25,28 +25,47 @@ core ビルドでの日本語タイトル表示は、環境にある X コアフ
 
 ## 状態
 
-**Phase 2 完了** — Windows 98 の外観で動作します。
+**Phase 4 完了** — タスクバー・スタートメニュー・システムトレイ・Alt+Tab まで動きます。
 
 ```
-make          # ビルド (依存: libxcb, xcb-randr, xcb-sync, xcb-keysyms)
-make test     # Xvfb 上で結合テスト
+make          # ビルド (依存: libxcb, xcb-randr, xcb-sync, xcb-keysyms, xcb-shape)
+make test     # Xvfb 上で結合テスト (11 本)
 make memcheck # メモリ実測 (SPEC §9.1)
 ```
 
-現時点で動くもの: Win98 の枠・タイトルバー・キャプションボタン・ウィンドウメニュー・
-カーソル、ウィンドウの管理・reparent、ICCCM/EWMH の主要プロパティ、
-フォーカス（ICCCM の 4 入力モデル）、移動・リサイズ（レート制御付き）、
-スタッキング、キーバインド、複数デスクトップ、マルチモニタ (RandR)。
+動くもの: Win98 の枠・タイトルバー・キャプションボタン・ウィンドウメニュー・カーソル、
+ウィンドウの管理と reparent、ICCCM 2.0 / EWMH 1.5 / Motif hints、
+フォーカス（ICCCM の 4 入力モデル）、移動・リサイズ（レート制御と `_NET_WM_SYNC_REQUEST`）、
+スタッキングとレイヤ、キーバインド、複数デスクトップ、マルチモニタ (RandR)、
+`_NET_WM_PING`、アイコン、CSD、Shape、
+**タスクバー（strut・タスクボタン・時計・トレイ）、スタートメニュー、Alt+Tab スイッチャ**。
 
-タスクバー・スタートメニュー・システムトレイは Phase 4 です。
+まだ無いもの: スタートメニューの階層化、タスクバーのオートハイドとスクロール矢印、
+最小化のズームアニメーション、デスクトップの右クリックメニュー、
+`Super` 単押しでの起動（タップ判定）。OpenBSD への移植は Phase 5。
+各項目の状態は [docs/PLAN.md](docs/PLAN.md) の「Phase 4 の結果」を参照。
 
-| 指標 | 実測 | 目標 |
-| --- | --- | --- |
-| Private_Dirty (0 窓) | 236 KB | < 400 KB |
-| Private_Dirty (20 窓) | 260 KB | < 1024 KB |
-| 窓あたりの限界費用 | 約 1.2 KB | < 2 KB |
+| 指標 | 実測 | 目標 | 判定 |
+| --- | --- | --- | --- |
+| Private_Dirty (0 窓・タスクバー無効) | 360 KB | < 400 KB | PASS |
+| Private_Dirty (0 窓・タスクバー/トレイ有効) | 364 KB | < 550 KB | PASS |
+| Private_Dirty (20 窓) | 384–396 KB | < 1024 KB | PASS |
+| 窓あたりの限界費用 | 1.0–1.4 KB | < 2 KB | PASS |
 
-詳細と読み方は [docs/MEMORY.md](docs/MEMORY.md)。タスクバー・トレイが未実装の
-段階の数字であり、最終的な達成を保証するものではありません。
+**絶対値は起動ごとに 250–370 KB の幅で揺れます**（glibc のアリーナ初期状態と ASLR による）。
+Phase 4 で計測方法の欠陥（限界費用を別プロセス間の差で測っていた）を直したため、
+Phase 1–3 の記録値とは直接比較できません。経緯は [docs/MEMORY.md](docs/MEMORY.md)。
+
+## 設定
+
+`$XDG_CONFIG_HOME/w98wm/config`（無ければ `~/.config/w98wm/config`）。
+スタートメニューの項目は同じディレクトリの `menu` に置きます:
+
+```
+# ラベル | コマンド 、"-" だけの行はセパレータ
+プログラム(P)                 | xterm
+-
+ファイル名を指定して実行(R)   | xterm -e sh
+```
 
 名称は実装が動いてから決めるため、現在の `w98wm` は仮称です（SPEC §11.1）。

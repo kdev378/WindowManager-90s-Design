@@ -497,6 +497,11 @@ void icccm_update_title(struct client *c)
 	c->draw_glyphs = 0;
 	c->caption_w_at_measure = 0;
 	c->draw_ellipsis = 0;
+	c->tb_glyphs = 0;
+	c->tb_ellipsis = 0;
+	c->tb_w_at_measure = 0;
+
+	taskbar_update();   /* タスクボタンの表示名 (§4.8) */
 }
 
 /* ------------------------------------------------------------------ *

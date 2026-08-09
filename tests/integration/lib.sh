@@ -92,7 +92,13 @@ start_wm() {
 		if ! kill -0 "$WM_PID" 2>/dev/null; then
 			fail "WM が起動直後に終了しました (ログ: $WM_PID_LOG)"
 		fi
-		if xprop -display "$DISPLAY" -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1; then
+		# _NET_SUPPORTING_WM_CHECK だけでは早すぎる。これは ewmh_init() の
+		# 冒頭で立つため、その後に書かれるルートプロパティ
+		# (_NET_NUMBER_OF_DESKTOPS 等) はまだ無い。実際に 060 が
+		# "nosuchatomonanywindow" で稀に落ちた。起動の最後まで待つ。
+		if xprop -display "$DISPLAY" -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1 &&
+			xprop -display "$DISPLAY" -root _NET_NUMBER_OF_DESKTOPS 2>/dev/null |
+				grep -q '[0-9]'; then
 			return 0
 		fi
 		sleep 0.2

@@ -226,6 +226,7 @@ M0_KB=""
 M1_KB=""
 M20_KB=""
 M20H_KB=""
+MEASURED_N=0
 
 # --- M0: ウィンドウ 0 枚・タスクバー無効 ---
 echo "-- M0 を計測中 (タスクバー無効) --"
@@ -234,18 +235,28 @@ if start_wm "taskbar=false" 0; then
 fi
 stop_wm
 
-# --- M1: ウィンドウ 0 枚・タスクバー/トレイ有効 ---
-echo "-- M1 を計測中 (タスクバー/トレイ有効) --"
+# --- M1 と M20 は「同じプロセス」で測る ---
+#
+# ★ ここは一度間違えた。M1 と M20 を別々に起動した WM で測ると、
+#   その差 (= 限界費用のゲート) に**起動ごとのばらつきがそのまま乗る**。
+#   同一バイナリでも Private_Dirty の起動直後の値は実測で 252〜368 KB の
+#   幅があり (malloc アリーナの初期状態や ASLR で変わる)、20 で割れば
+#   ±3 KB/窓。判定しようとしている 2 KB/窓より大きい。
+#   つまり別プロセスで測った限界費用は**雑音を測っている**。
+#
+#   1 つのプロセスで「0 窓 → 20 窓」の差を取れば、その差は本当に
+#   窓が増えた分だけになる。M0 だけは taskbar=false の別設定が要るので
+#   独立した起動のまま（こちらは絶対値の判定なので差の雑音は効かない）。
+count_managed() {
+	xprop -display "$DISPLAY" -root _NET_CLIENT_LIST 2>/dev/null |
+		tr ',' '\n' | grep -c '0x' || echo 0
+}
+
+echo "-- M1 / M20 を計測中 (同一プロセス。タスクバー/トレイ有効) --"
 if start_wm "taskbar=true
 tray=true" 1; then
 	M1_KB=$(measure_pd "$WM_PID") || M1_KB=""
-fi
-stop_wm
 
-# --- M20: 20 ウィンドウ・タスクバー/トレイ有効 ---
-echo "-- M20 を計測中 (xterm 20枚) --"
-if start_wm "taskbar=true
-tray=true" 2; then
 	j=0
 	while [ $j -lt 20 ]; do
 		xterm -display "$DISPLAY" >/dev/null 2>&1 &
@@ -253,21 +264,21 @@ tray=true" 2; then
 		j=$((j + 1))
 	done
 
-	if command -v xdotool >/dev/null 2>&1; then
-		k=0
-		n=0
-		while [ $k -lt 100 ]; do
-			n=$(xdotool search --onlyvisible --name '.*' 2>/dev/null | wc -l | tr -d ' ')
-			if [ "${n:-0}" -ge 20 ] 2>/dev/null; then
-				break
-			fi
-			sleep 0.2
-			k=$((k + 1))
-		done
-	else
-		sleep 5
+	# 実際に 20 枚が**管理下に入った**ことを _NET_CLIENT_LIST で確認する。
+	# xdotool search は xterm の内部ウィンドウも数えるため当てにならない。
+	k=0
+	n=0
+	while [ $k -lt 150 ]; do
+		n=$(count_managed)
+		[ "${n:-0}" -ge 20 ] 2>/dev/null && break
+		sleep 0.2
+		k=$((k + 1))
+	done
+	if [ "${n:-0}" -lt 20 ]; then
+		echo "警告: 20 枚に届きませんでした (実際 $n 枚)。限界費用の判定は参考値です。" >&2
 	fi
-	sleep 1
+	MEASURED_N="${n:-0}"
+	sleep 2
 
 	M20_KB=$(measure_pd "$WM_PID") || M20_KB=""
 
@@ -348,6 +359,10 @@ echo "-----  ----------  ---------------------------------------  ----"
 printf '%-5s  %10s  %-41s  %s\n' "M0" "$(fmt "$M0_KB")" "< 400 KB" "$M0_PASS"
 printf '%-5s  %10s  %-41s  %s\n' "M1" "$(fmt "$M1_KB")" "< 550 KB" "$M1_PASS"
 printf '%-5s  %10s  %-41s  %s\n' "M20" "$(fmt "$M20_KB")" "(M20-M1)/20<2KB かつ M20<1024KB" "$M20_PASS"
+if [ -n "$M20_KB" ] && [ -n "$M1_KB" ]; then
+	printf '       %10s  %s\n' "" \
+	  "(内訳: M20-M1 = $((M20_KB - M1_KB)) KB / 実測 ${MEASURED_N} 窓 = 同一プロセス内の差)"
+fi
 if [ "$LONG" -eq 1 ]; then
 	printf '%-5s  %10s  %-41s  %s\n' "M20h" "$(fmt "$M20H_KB")" "M20h-M20 < 32 KB" "$M20H_PASS"
 else

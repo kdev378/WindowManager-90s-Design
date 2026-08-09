@@ -102,10 +102,28 @@ static void event_loop(void)
 	pfd[1].fd = wm.sig_pipe[0];
 	pfd[1].events = POLLIN;
 
+	/*
+	 * アイドル時の malloc_trim (SPEC §9.2)
+	 *
+	 * クライアントを管理に取り込むとき、プロパティ読み取りと xcb の
+	 * リプライで一時領域を大量に確保しては解放する。解放しても glibc の
+	 * アリーナは縮まないので、**使っていない**のに Private_Dirty に
+	 * 残り続ける。実測では 20 窓を一気に開くとヒープが 40→76 KB に育ち、
+	 * その差 36 KB がまるごとこれだった（窓あたり 1.8 KB 相当で、
+	 * §9.1 の 2 KB/窓ゲートの大半を占めていた）。
+	 *
+	 * 何もイベントが来ない状態が続いたら 1 回だけ返す。ドラッグ中や
+	 * 連続してウィンドウが開いている最中には走らないので、
+	 * 「返した直後にまた確保する」振動は起きない。
+	 * glibc 以外では no-op。
+	 */
+	bool idle_trimmed = false;
+
 	while (wm.running) {
 		xcb_generic_event_t *ev;
 		uint64_t now;
 		int timeout, ret;
+		bool saw_event = false;
 
 		/* 送信待ちを掃き出してからブロックする（忘れると固まる） */
 		xcb_flush(wm.conn);
@@ -117,7 +135,7 @@ static void event_loop(void)
 		 * ミリ秒精度の要求より粗い。待ちなし(-1)の時だけ 1 秒で起こす。
 		 */
 		if (timeout < 0)
-			timeout = 1000;
+			timeout = 1000;   /* 時計 (§4.8) と ping/起動通知の粗い刻み */
 
 		ret = poll(pfd, 2, timeout);
 		if (ret < 0 && errno != EINTR) {
@@ -137,15 +155,40 @@ static void event_loop(void)
 				LOG("設定を再読み込み");
 				config_free(&wm.cfg);
 				config_load(&wm.cfg);
+				theme_init();          /* 配色とメトリクスを取り直す */
 				input_regrab_keys();
+				/*
+				 * 配色の変更はここで全面に効く。ただしタスクバーの
+				 * 高さ (scale 由来) だけは作り直しが要るため反映しない
+				 * ——トレイに埋め込み済みのアイコンを巻き込むため。
+				 * scale の変更は再起動が必要 (README に記載)。
+				 */
+				taskbar_update_strut();
+				taskbar_update();
+				{
+					struct client *rc;
+					for (rc = wm.stack_bottom; rc != NULL; rc = rc->next)
+						if (rc->flags & CF_DECORATED)
+							deco_draw(rc, NULL);
+				}
 			}
 		}
 
 		while ((ev = xcb_poll_for_event(wm.conn)) != NULL) {
+			saw_event = true;
 			event_dispatch(ev);
 			free(ev);
 			if (!wm.running)
 				break;
+		}
+
+		if (saw_event) {
+			idle_trimmed = false;
+		} else if (!idle_trimmed && !move_active()) {
+			idle_trimmed = true;
+#ifdef __GLIBC__
+			malloc_trim(0);
+#endif
 		}
 
 		if (xcb_connection_has_error(wm.conn)) {
@@ -156,6 +199,7 @@ static void event_loop(void)
 		{
 			uint64_t t = wm_now_ms();
 			move_tick(t);
+			taskbar_tick(t);           /* §4.8 時計と点滅 */
 			sync_check_timeout(t);     /* §7.3 250ms */
 			ping_check_timeout(t);     /* §7.4 5s */
 			startup_check_timeout(t);  /* §7.4 15s */
@@ -201,6 +245,11 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
+	/* タスクバーとトレイ (§4.8)。既存クライアントを採用し終えた後に立てる */
+	taskbar_init();
+	tray_init();
+	taskbar_update();
+
 	/*
 	 * OpenBSD の権限縮小 (SPEC Phase 5)。X 接続確立後に絞る。
 	 * proc/exec はキーバインドからのアプリ起動に必要。
@@ -217,6 +266,9 @@ int main(int argc, char **argv)
 	event_loop();
 
 	menu_close();
+	switcher_end(true);
+	tray_fini();
+	taskbar_fini();
 	cursor_fini();
 	font_fini();
 	draw_fini();

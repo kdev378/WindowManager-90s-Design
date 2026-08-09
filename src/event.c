@@ -546,6 +546,20 @@ void event_dispatch(xcb_generic_event_t *ev)
 	if (menu_active() && menu_handle_event(ev))
 		return;
 
+	/*
+	 * スイッチャ (§6) はキーボードだけを掴む。DestroyNotify は
+	 * 候補から外した上で client.c 側の後始末にも渡す必要があるため、
+	 * switcher_handle_event() が false を返す経路がある。
+	 */
+	if (switcher_active() && switcher_handle_event(ev))
+		return;
+
+	/* タスクバーとトレイ (§4.8)。自分のウィンドウ宛だけを消費する */
+	if (taskbar_handle_event(ev))
+		return;
+	if (tray_handle_event(ev))
+		return;
+
 	/* XSync のアラーム (SPEC §7.3) と Shape (§5.3) */
 	if (sync_handle_event(ev))
 		return;

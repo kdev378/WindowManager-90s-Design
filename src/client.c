@@ -757,6 +757,7 @@ void client_unmanage(struct client *c, bool destroyed)
 
 	/* リストから外してからフォーカスを渡す。
 	 * 先に外すのは、focus_next_after() が候補走査でこの client を拾わないため。 */
+	switcher_drop_client(c);   /* 候補配列から外す。slab_free より前に必ず */
 	focus_mru_remove(c);
 	stack_remove(c);
 	/* パネルが閉じたら作業領域を返す (§3.5.2) */
@@ -824,6 +825,7 @@ void client_iconify(struct client *c)
 		wm.focused = NULL;
 		focus_next_after(c);
 	}
+	taskbar_update();
 }
 
 void client_deiconify(struct client *c)
@@ -844,6 +846,7 @@ void client_deiconify(struct client *c)
 	c->states &= ~(uint32_t)ST_HIDDEN;
 	client_set_state(c, WM_STATE_NORMAL);
 	ewmh_set_wm_state(c);
+	taskbar_update();
 }
 
 /* ================================================================== *

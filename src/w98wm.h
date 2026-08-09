@@ -53,6 +53,7 @@
 #define WM_MAX_DESKTOPS      16   /* (§3.8) */
 #define WM_MAX_MONITORS      16
 #define WM_MAX_BINDINGS     128   /* (§8) */
+#define WM_MAX_START_ENTRIES 24   /* スタートメニューの設定項目 (§4.9) */
 #define WM_TRANSIENT_DEPTH   16   /* 循環検出の打ち切り (§3.7.2) */
 
 #define WM_DRAG_INTERVAL_MS  16   /* 約 60Hz のレート上限 (§3.4.1) */
@@ -258,6 +259,10 @@ struct client {
 	uint8_t      draw_glyphs;
 	uint8_t      draw_ellipsis;
 	uint16_t     caption_w_at_measure;
+	/* タスクボタン用の同じ仕組み (§4.8)。キャプションとは幅が違うので別に持つ */
+	uint8_t      tb_glyphs;
+	uint8_t      tb_ellipsis;
+	uint16_t     tb_w_at_measure;
 
 	uint32_t     user_time;   /* _NET_WM_USER_TIME (§3.6) */
 	xcb_window_t user_time_win;/* _NET_WM_USER_TIME_WINDOW */
@@ -305,6 +310,18 @@ struct binding {
 	char        *arg;         /* exec の引数。パース時に確保して常駐 */
 };
 
+/*
+ * スタートメニューの項目 (§4.9)。
+ * `~/.config/<WM_CONFIG_DIR>/menu` を 1 行 1 項目で読む。
+ *   ラベル | コマンド      … 起動する項目
+ *   -                      … セパレータ
+ * XDG の .desktop 走査は行わない（§4.9 の決定）。
+ */
+struct start_entry {
+	char *label;              /* セパレータなら NULL */
+	char *cmd;
+};
+
 /* キーバインドの動作 */
 enum {
 	ACT_NONE = 0, ACT_CLOSE, ACT_SWITCH_NEXT, ACT_SWITCH_PREV,
@@ -335,6 +352,9 @@ struct config {
 
 	struct binding bindings[WM_MAX_BINDINGS];
 	uint16_t n_bindings;
+
+	struct start_entry start[WM_MAX_START_ENTRIES];
+	uint16_t n_start;
 };
 
 bool config_load(struct config *cfg);       /* 既定値を入れてからファイルを読む */
@@ -634,6 +654,14 @@ uint8_t deco_part_edge(enum frame_part p);
 /* 部位に対応するカーソル (CURSOR_*) */
 int  deco_part_cursor(enum frame_part p);
 void deco_set_cursor(struct client *c, enum frame_part p);
+/*
+ * アイコンを任意の drawable の (x,y) へ sz 角で描く (§4.4.1)。
+ * マスク付き CopyArea とフォールバックの内蔵アイコンをここに集約する。
+ * タスクバーとスイッチャもこれを使うこと（自前で CopyArea すると
+ * マスクが効かず、透明部分が黒く出る）。
+ */
+void deco_draw_icon_at(const struct client *c, xcb_drawable_t d,
+                       int16_t x, int16_t y, uint16_t sz);
 
 /* ================================================================== *
  * menu.c — ポップアップメニュー (SPEC §4.6)
@@ -643,16 +671,78 @@ void deco_set_cursor(struct client *c, enum frame_part p);
 struct menu_item {
 	const char *label;
 	uint8_t     action;      /* ACT_* */
+	const char *arg;         /* ACT_EXEC のコマンド。NULL 可 */
 	const char *accel;       /* "Alt+F4" 等。右寄せ表示。NULL 可 */
 	bool        enabled;
 	bool        separator;
 };
 
 void menu_open_window_menu(struct client *c, int16_t root_x, int16_t root_y);
+/*
+ * スタートメニュー (§4.9)。(x, y) はメニューの**左下**の位置
+ * （タスクバーの上に生やすため、ウィンドウメニューと基準が違う）。
+ */
+void menu_open_start(int16_t x, int16_t bottom_y);
 bool menu_active(void);
 void menu_close(void);
 /* メニューが開いている間はイベントをここへ回す。処理したら true */
 bool menu_handle_event(xcb_generic_event_t *ev);
+
+/* ================================================================== *
+ * taskbar.c — タスクバー (SPEC §4.8)
+ * ================================================================== */
+
+enum { TB_BOTTOM = 0, TB_TOP, TB_LEFT, TB_RIGHT };
+
+void taskbar_init(void);
+void taskbar_fini(void);
+void taskbar_update(void);          /* クライアント一覧が変わった */
+void taskbar_draw(const xcb_rectangle_t *clip);
+void taskbar_tick(uint64_t now_ms); /* 時計の更新と点滅 */
+bool taskbar_handle_event(xcb_generic_event_t *ev);  /* 処理したら true */
+bool taskbar_owns(xcb_window_t w);
+/* strut を張り直す。モニタ構成やオートハイドの変化で呼ぶ */
+void taskbar_update_strut(void);
+/*
+ * strut を載せているパネルウィンドウ。無効なら XCB_WINDOW_NONE。
+ * タスクバーは override-redirect でクライアント一覧に載らないため、
+ * layout.c が作業領域を計算するときに明示的に走査する必要がある (§3.5.2)。
+ */
+xcb_window_t taskbar_strut_window(void);
+/* スタートメニューが閉じたことを知らせる。menu.c から呼ぶ */
+void taskbar_start_closed(void);
+/* キーバインド (Ctrl+Esc / Super) からスタートメニューを開く */
+void taskbar_open_start_menu(void);
+
+/* ================================================================== *
+ * switcher.c — Alt+Tab のタスクスイッチャ (SPEC §6)
+ * ================================================================== */
+
+void switcher_begin(bool backwards);
+/*
+ * 管理を外れるクライアントを候補から取り除く。**client_unmanage() から必ず
+ * 呼ぶこと。** スイッチャは開いた時点の候補を配列で持つので、呼び忘れると
+ * slab_free() 済みの struct client を指したままになる。DestroyNotify だけを
+ * 見ていると、withdraw (UnmapNotify) で消えた窓を取りこぼす。
+ */
+void switcher_drop_client(struct client *c);
+void switcher_step(bool backwards);
+void switcher_end(bool cancel);
+bool switcher_active(void);
+bool switcher_handle_event(xcb_generic_event_t *ev);
+
+/* ================================================================== *
+ * tray.c — システムトレイ (SPEC §4.8、XEmbed)
+ * ================================================================== */
+
+void tray_init(void);
+void tray_fini(void);
+bool tray_handle_event(xcb_generic_event_t *ev);
+/* トレイが要求する幅。タスクバーが配置に使う */
+uint16_t tray_width(void);
+/* タスクバーが決めた位置へトレイ領域を移す */
+void tray_place(int16_t x, int16_t y, uint16_t h);
+void tray_draw(void);
 
 /* ================================================================== *
  * event.c — ディスパッチ
@@ -685,6 +775,7 @@ bool ewmh_handle_client_message(xcb_client_message_event_t *ev);
 bool ewmh_allow_activation(struct client *c, uint32_t source, xcb_timestamp_t t);
 void ewmh_set_demands_attention(struct client *c, bool on);
 void ewmh_update_showing_desktop(void);
+void ewmh_toggle_showing_desktop(void);
 
 /* ================================================================== *
  * motif.c — _MOTIF_WM_HINTS と CSD (SPEC §3.2, §7.2)

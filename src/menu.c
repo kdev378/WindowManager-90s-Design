@@ -10,6 +10,7 @@
  * ウィンドウを作り、閉じるときに破棄する（常駐させない）。
  */
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -24,13 +25,15 @@
  * 定数
  * ================================================================== */
 
-#define MENU_MAX_ITEMS   8
+#define MENU_MAX_ITEMS  32
 #define MENU_BORDER      2   /* draw_bevel(BEVEL_RAISED) が外側+内側で 2px 引く */
 #define CONTENT_PAD      3   /* 縁と項目列の間の余白 */
 #define TEXT_LEFT_PAD    20  /* Win98 のチェック/アイコン用ガター相当 */
 #define TEXT_RIGHT_PAD   8
 #define ACCEL_GAP        16  /* ラベルとアクセラレータ文字列の最小間隔 */
 #define MENU_MIN_CONTENT_W 96
+#define BANNER_W         22  /* スタートメニュー左端の縦バナー (§4.9) */
+#define BANNER_TEXT_GAP   2
 
 /* ================================================================== *
  * 状態
@@ -50,6 +53,9 @@ struct menu_state {
 
 	int             selected;        /* 選択中の index。無ければ -1 */
 
+	bool            is_start;        /* スタートメニュー (§4.9) */
+	uint16_t        banner_w;        /* 縦バナーの幅。0 なら無し */
+
 	int16_t         x, y;
 	uint16_t        w, h;
 };
@@ -59,6 +65,18 @@ static struct menu_state g_menu;
 /* ================================================================== *
  * 汎用ポップアップ機構
  * ================================================================== */
+
+/* 項目列の左端 x と幅。バナーの分だけ右へずれる (§4.9) */
+static int content_x(void)
+{
+	return MENU_BORDER + (int)g_menu.banner_w;
+}
+
+static int content_w(void)
+{
+	int w = (int)g_menu.w - 2 * MENU_BORDER - (int)g_menu.banner_w;
+	return w < 0 ? 0 : w;
+}
 
 static bool item_selectable(int i)
 {
@@ -133,7 +151,7 @@ static void compute_layout(void)
 {
 	const struct metrics *m = theme_metrics();
 	int y = MENU_BORDER + CONTENT_PAD;
-	int content_w = MENU_MIN_CONTENT_W;
+	int content_width = MENU_MIN_CONTENT_W;
 	int i;
 
 	for (i = 0; i < g_menu.n_items; i++) {
@@ -153,8 +171,8 @@ static void compute_layout(void)
 				g_menu.accel_w[i] = font_text_width(it->accel, strlen(it->accel));
 				need += ACCEL_GAP + (int)g_menu.accel_w[i];
 			}
-			if (need > content_w)
-				content_w = need;
+			if (need > content_width)
+				content_width = need;
 			h = (int)m->menu_item_h;
 		}
 
@@ -163,7 +181,7 @@ static void compute_layout(void)
 	}
 
 	g_menu.h = (uint16_t)(y + CONTENT_PAD + MENU_BORDER);
-	g_menu.w = (uint16_t)(content_w + 2 * MENU_BORDER);
+	g_menu.w = (uint16_t)(content_width + 2 * MENU_BORDER + (int)g_menu.banner_w);
 }
 
 /* 要求座標をモニタの作業領域内へ収める（右/下にはみ出せば反転） */
@@ -273,8 +291,8 @@ static void ungrab_input(void)
 
 static void draw_separator(int i)
 {
-	int x = MENU_BORDER + 3;
-	int w = (int)g_menu.w - 2 * MENU_BORDER - 6;
+	int x = content_x() + 3;
+	int w = content_w() - 6;
 	int y = g_menu.item_top[i] + (g_menu.item_h[i] - 2) / 2;
 
 	if (w < 0)
@@ -285,8 +303,8 @@ static void draw_separator(int i)
 static void draw_one_item(int i, bool selected)
 {
 	const struct menu_item *it = &g_menu.items[i];
-	int x = MENU_BORDER;
-	int w = (int)g_menu.w - 2 * MENU_BORDER;
+	int x = content_x();
+	int w = content_w();
 	int y = g_menu.item_top[i];
 	int h = g_menu.item_h[i];
 	int fh, base_y, text_x;
@@ -340,6 +358,96 @@ static void draw_one_item(int i, bool selected)
 	}
 }
 
+/*
+ * 縦バナー (SPEC §4.9)。
+ *
+ * 上が shadow (#808080)、下が dkshadow (#000000) の縦グラデーションに、
+ * 名称を 1 文字ずつ縦に積んで描く。コアプロトコルの PolyText16 には
+ * 文字の回転が無いため、Win98 の 90 度回転そのものは再現できない
+ * （回転させるにはグリフを 1 枚ずつ Pixmap へ描いて転置する必要があり、
+ *  往復とメモリの両面で §9 の予算に見合わない）。ここは意図的な差異。
+ *
+ * グラデーションは §4.4 と同じ「色が実際に変わる境界でだけ分割する」方式。
+ * shadow→dkshadow は 129 段で、メニューを開いた時にしか描かないので
+ * リクエスト量は問題にならない。
+ */
+static void draw_banner(void)
+{
+	uint32_t top = wm.cfg.color[THEME_SHADOW];
+	uint32_t bot = wm.cfg.color[THEME_DKSHADOW];
+	int h = (int)g_menu.h - 2 * MENU_BORDER;
+	int y0 = MENU_BORDER;
+	int x0 = MENU_BORDER;
+	int w = (int)g_menu.banner_w;
+	int i, n;
+	const char *name = WM_DISPLAY_NAME;
+
+	if (w <= 0 || h <= 0)
+		return;
+
+	/* 段数 = 3 チャネルの変化量の最大 + 1。各段は等幅で割り付ける */
+	{
+		int dr = abs((int)((top >> 16) & 0xff) - (int)((bot >> 16) & 0xff));
+		int dg = abs((int)((top >> 8) & 0xff) - (int)((bot >> 8) & 0xff));
+		int db = abs((int)(top & 0xff) - (int)(bot & 0xff));
+		n = dr > dg ? dr : dg;
+		if (db > n)
+			n = db;
+		n += 1;
+		if (n > h)
+			n = h;
+		if (n < 1)
+			n = 1;
+	}
+
+	for (i = 0; i < n; i++) {
+		int band_y = y0 + (int)((int64_t)h * i / n);
+		int band_h = y0 + (int)((int64_t)h * (i + 1) / n) - band_y;
+		uint32_t col = 0;
+		int ch;
+
+		for (ch = 0; ch < 3; ch++) {
+			int shift = 16 - ch * 8;
+			int a = (int)((top >> shift) & 0xff);
+			int b = (int)((bot >> shift) & 0xff);
+			int v = n > 1 ? a + (b - a) * i / (n - 1) : a;
+			col |= (uint32_t)v << shift;
+		}
+		if (band_h > 0)
+			draw_rect(g_menu.win, (int16_t)x0, (int16_t)band_y,
+			          (uint16_t)w, (uint16_t)band_h, col);
+	}
+
+	/* 名称を 1 文字ずつ縦に積む。下端から上へ向かって並べる */
+	{
+		int fh = (int)font_height();
+		int len = (int)strlen(name);
+		int total, cy;
+
+		if (fh <= 0)
+			return;
+		total = len * fh;
+		if (total > h - 8)
+			len = (h - 8) / fh;      /* 入らない分は捨てる */
+		if (len <= 0)
+			return;
+
+		cy = y0 + h - 6 - len * fh;
+		for (i = 0; i < len; i++) {
+			char cbuf[2];
+			uint16_t cw;
+
+			cbuf[0] = name[i];
+			cbuf[1] = '\0';
+			cw = font_text_width(cbuf, 1);
+			font_draw(g_menu.win,
+			          (int16_t)(x0 + (w - (int)cw) / 2),
+			          (int16_t)(cy + i * fh + (int)font_ascent()),
+			          cbuf, 1, wm.cfg.color[THEME_HILIGHT]);
+		}
+	}
+}
+
 static void draw_menu(void)
 {
 	int i;
@@ -349,6 +457,9 @@ static void draw_menu(void)
 
 	draw_rect(g_menu.win, 0, 0, g_menu.w, g_menu.h, wm.cfg.color[THEME_MENU_BG]);
 	draw_bevel(g_menu.win, 0, 0, g_menu.w, g_menu.h, BEVEL_RAISED);
+
+	if (g_menu.banner_w > 0)
+		draw_banner();
 
 	for (i = 0; i < g_menu.n_items; i++)
 		draw_one_item(i, i == g_menu.selected);
@@ -382,13 +493,26 @@ static int item_at_y(int local_y)
 static void activate_index(int i)
 {
 	uint8_t action;
+	const char *arg;
 	struct client *c;
+	static char argbuf[512];
 
 	if (!item_selectable(i))
 		return;
 
 	action = g_menu.items[i].action;
+	arg = g_menu.items[i].arg;
 	c = g_menu.client;
+
+	/*
+	 * arg は cfg->start[] が所有する文字列を借りている。menu_close() は
+	 * cfg を触らないので現状は生き残るが、SIGHUP による設定再読み込みと
+	 * 競合しうるため、閉じる前に控えを取ってから使う。
+	 */
+	if (arg != NULL) {
+		snprintf(argbuf, sizeof argbuf, "%s", arg);
+		arg = argbuf;
+	}
 
 	/*
 	 * 先に閉じて grab を手放す。ACT_MOVE_KB / ACT_RESIZE_KB は move.c が
@@ -396,7 +520,7 @@ static void activate_index(int i)
 	 * 二重 grab で失敗する。
 	 */
 	menu_close();
-	input_run_action(action, NULL, c);
+	input_run_action(action, arg, c);
 }
 
 static void handle_motion(int16_t root_x, int16_t root_y)
@@ -502,6 +626,12 @@ void menu_close(void)
 	g_menu.n_items = 0;
 	g_menu.selected = -1;
 
+	if (g_menu.is_start) {
+		g_menu.is_start = false;
+		g_menu.banner_w = 0;
+		taskbar_start_closed();   /* スタートボタンの押し込みを戻す */
+	}
+
 	xcb_flush(wm.conn);
 }
 
@@ -555,8 +685,22 @@ static void set_item(int idx, const char *label, uint8_t action,
 
 	it->label = label;
 	it->action = action;
+	it->arg = NULL;
 	it->accel = accel;
 	it->enabled = enabled;
+	it->separator = false;
+}
+
+/* ACT_EXEC の項目。arg は cfg->start[] の文字列を借りるだけで所有しない */
+static void set_exec_item(int idx, const char *label, const char *cmd)
+{
+	struct menu_item *it = &g_menu.items[idx];
+
+	it->label = label;
+	it->action = ACT_EXEC;
+	it->arg = cmd;
+	it->accel = NULL;
+	it->enabled = true;
 	it->separator = false;
 }
 
@@ -566,6 +710,7 @@ static void set_separator(int idx)
 
 	it->label = NULL;
 	it->action = ACT_NONE;
+	it->arg = NULL;
 	it->accel = NULL;
 	it->enabled = false;
 	it->separator = true;
@@ -627,6 +772,88 @@ void menu_open_window_menu(struct client *c, int16_t root_x, int16_t root_y)
 	}
 
 	g_menu.client = c;
+	g_menu.selected = -1;
+	g_menu.active = true;
+	g_menu.keysyms = xcb_key_symbols_alloc(wm.conn);
+
+	xcb_flush(wm.conn);
+}
+
+/* ================================================================== *
+ * スタートメニュー (SPEC §4.9)
+ *
+ * 項目は `~/.config/<WM_CONFIG_DIR>/menu` の内容（config.c が読む）に、
+ * WM 自身の操作を組み込み項目として足したもの。XDG の .desktop 走査は
+ * §4.9 の決定どおり行わない。
+ *
+ * v1.0 の制限: **階層メニューは未実装**（フラットな 1 段のみ）。
+ * ポップアップを入れ子にすると grab の受け渡しと親メニューの選択保持が
+ * 要るため、Phase 4 の範囲からは外した。SPEC §4.9 との差異として記録する。
+ * ================================================================== */
+
+static void build_start_menu_items(void)
+{
+	int n = 0;
+	uint16_t i;
+
+	for (i = 0; i < wm.cfg.n_start && n < MENU_MAX_ITEMS - 4; i++) {
+		if (wm.cfg.start[i].label == NULL) {
+			if (n > 0 && !g_menu.items[n - 1].separator)
+				set_separator(n++);
+		} else {
+			set_exec_item(n, wm.cfg.start[i].label, wm.cfg.start[i].cmd);
+			n++;
+		}
+	}
+
+	if (n > 0 && !g_menu.items[n - 1].separator)
+		set_separator(n++);
+
+	set_item(n++, "デスクトップの表示(D)", ACT_SHOW_DESKTOP, NULL, true);
+	set_separator(n++);
+	set_item(n++, "終了(U)", ACT_QUIT, NULL, true);
+
+	g_menu.n_items = n;
+}
+
+void menu_open_start(int16_t x, int16_t bottom_y)
+{
+	if (g_menu.active)
+		menu_close();
+
+	g_menu.is_start = true;
+	g_menu.banner_w = (uint16_t)(BANNER_W * theme_metrics()->scale);
+
+	build_start_menu_items();
+	if (g_menu.n_items <= 0) {
+		g_menu.is_start = false;
+		g_menu.banner_w = 0;
+		taskbar_start_closed();
+		return;
+	}
+
+	compute_layout();
+
+	/*
+	 * ウィンドウメニューと違い、基準は**左下**。タスクバーの上へ生やす。
+	 * position_popup() は左上を基準に作業領域へ収めるので、
+	 * 高さの分だけ持ち上げてから渡す。
+	 */
+	position_popup(x, (int16_t)(bottom_y - (int16_t)g_menu.h));
+	create_popup_window();
+
+	if (!grab_input()) {
+		xcb_destroy_window(wm.conn, g_menu.win);
+		g_menu.win = XCB_NONE;
+		g_menu.is_start = false;
+		g_menu.banner_w = 0;
+		g_menu.n_items = 0;
+		taskbar_start_closed();
+		xcb_flush(wm.conn);
+		return;
+	}
+
+	g_menu.client = NULL;
 	g_menu.selected = -1;
 	g_menu.active = true;
 	g_menu.keysyms = xcb_key_symbols_alloc(wm.conn);

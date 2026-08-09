@@ -236,7 +236,27 @@ void layout_update_workareas(void)
 	const int32_t screen_x1 = (int32_t)wm.screen->width_in_pixels;
 	const int32_t screen_y1 = (int32_t)wm.screen->height_in_pixels;
 
-	for (struct client *c = wm.stack_bottom; c != NULL; c = c->next) {
+	/*
+	 * strut を持つのは管理下のクライアントだけではない。**内蔵タスクバーは
+	 * override-redirect なので wm.stack_bottom には載らない** (§4.8)。
+	 * ここを取りこぼすと自分のパネルの下にウィンドウが最大化される
+	 * （実際にそうなっていた）。走査対象に自前のパネルを明示的に足す。
+	 */
+	{
+	xcb_window_t extra = taskbar_strut_window();
+	struct client *c = wm.stack_bottom;
+	xcb_window_t cur;
+
+	for (;;) {
+		if (c != NULL) {
+			cur = c->win;
+		} else if (extra != XCB_WINDOW_NONE) {
+			cur = extra;
+			extra = XCB_WINDOW_NONE;
+		} else {
+			break;
+		}
+
 		int32_t left = 0, right = 0, top = 0, bottom = 0;
 		/* strut のスパン。レガシー _NET_WM_STRUT は辺全体とみなす (§3.5.2) */
 		int32_t lsy0 = screen_y0, lsy1 = screen_y1;
@@ -246,7 +266,7 @@ void layout_update_workareas(void)
 		bool have = false;
 
 		uint32_t plen = 0;
-		uint32_t *partial = prop_get_card32_list(c->win,
+		uint32_t *partial = prop_get_card32_list(cur,
 		    atoms[ATOM_NET_WM_STRUT_PARTIAL], XCB_ATOM_CARDINAL, &plen);
 		if (partial != NULL && plen >= 12) {
 			left   = (int32_t)partial[0];
@@ -267,7 +287,7 @@ void layout_update_workareas(void)
 
 		if (!have) {
 			uint32_t llen = 0;
-			uint32_t *legacy = prop_get_card32_list(c->win,
+			uint32_t *legacy = prop_get_card32_list(cur,
 			    atoms[ATOM_NET_WM_STRUT], XCB_ATOM_CARDINAL, &llen);
 			if (legacy != NULL && llen >= 4) {
 				left   = (int32_t)legacy[0];
@@ -279,8 +299,11 @@ void layout_update_workareas(void)
 			free(legacy);
 		}
 
-		if (!have || (left == 0 && right == 0 && top == 0 && bottom == 0))
+		if (!have || (left == 0 && right == 0 && top == 0 && bottom == 0)) {
+			if (c != NULL)
+				c = c->next;
 			continue;
+		}
 
 		for (uint8_t i = 0; i < wm.n_monitors; i++) {
 			struct monitor *m = &wm.monitors[i];
@@ -319,6 +342,10 @@ void layout_update_workareas(void)
 					bottom_inset[i] = bottom;
 			}
 		}
+
+		if (c != NULL)
+			c = c->next;
+	}
 	}
 
 	for (uint8_t i = 0; i < wm.n_monitors; i++) {
@@ -581,15 +608,48 @@ void layout_place_new(struct client *c)
  * CSD クライアントは可視矩形 V が作業領域に一致するよう W = workarea + gtk_extents を
  * 設定する (§7.2)。
  */
+/*
+ * 最大化の基準は「**可視矩形**が作業領域と一致すること」(§3.5, §7.2)。
+ *
+ * SSD ではフレーム（ボーダー + キャプション）が可視矩形なので、
+ * クライアント領域はその分だけ内側に置く。ここを取り違えて
+ * `geom = workarea` にすると、フレームが作業領域を frame_offsets の分だけ
+ * はみ出す。上辺のはみ出しは **キャプションが画面外へ出る**（最大化した窓の
+ * タイトルバーが見えず、マウスで元に戻せない）という形で効き、
+ * 下辺のはみ出しはタスクバーの上端を覆う。実際にそうなっていた。
+ *
+ * CSD では逆に _GTK_FRAME_EXTENTS（影と不可視ボーダー）の分だけ外へ広げる。
+ * こちらは可視矩形が extents を差し引いた内側だからで、符号が逆になるのは
+ * 意図どおり。
+ */
+static void frame_inset(const struct client *c, int32_t *l, int32_t *r,
+                        int32_t *t, int32_t *b)
+{
+	uint16_t fl, fr, ft, fb;
+
+	if (c->flags & CF_CSD) {
+		*l = -(int32_t)c->gtk_extents[0];
+		*r = -(int32_t)c->gtk_extents[1];
+		*t = -(int32_t)c->gtk_extents[2];
+		*b = -(int32_t)c->gtk_extents[3];
+		return;
+	}
+	client_frame_offsets(c, &fl, &fr, &ft, &fb);
+	*l = fl;
+	*r = fr;
+	*t = ft;
+	*b = fb;
+}
+
 static void axis_horz_on(struct client *c, const struct monitor *mon)
 {
-	int32_t l = 0, r = 0;
-	if (c->flags & CF_CSD) {
-		l = c->gtk_extents[0];
-		r = c->gtk_extents[1];
-	}
-	c->geom.x = (int16_t)(mon->workarea.x - l);
-	c->geom.w = (uint16_t)((int32_t)mon->workarea.w + l + r);
+	int32_t l, r, t, b;
+	int32_t w;
+
+	frame_inset(c, &l, &r, &t, &b);
+	c->geom.x = (int16_t)((int32_t)mon->workarea.x + l);
+	w = (int32_t)mon->workarea.w - l - r;
+	c->geom.w = (uint16_t)(w > 1 ? w : 1);
 }
 
 static void axis_horz_off(struct client *c)
@@ -600,13 +660,13 @@ static void axis_horz_off(struct client *c)
 
 static void axis_vert_on(struct client *c, const struct monitor *mon)
 {
-	int32_t t = 0, b = 0;
-	if (c->flags & CF_CSD) {
-		t = c->gtk_extents[2];
-		b = c->gtk_extents[3];
-	}
-	c->geom.y = (int16_t)(mon->workarea.y - t);
-	c->geom.h = (uint16_t)((int32_t)mon->workarea.h + t + b);
+	int32_t l, r, t, b;
+	int32_t h;
+
+	frame_inset(c, &l, &r, &t, &b);
+	c->geom.y = (int16_t)((int32_t)mon->workarea.y + t);
+	h = (int32_t)mon->workarea.h - t - b;
+	c->geom.h = (uint16_t)(h > 1 ? h : 1);
 }
 
 static void axis_vert_off(struct client *c)

@@ -29,7 +29,8 @@ OBJS = src/main.o src/wm.o src/event.o src/client.o src/icccm.o \
        src/ewmh.o src/atoms.o src/stack.o src/focus.o src/move.o \
        src/layout.o src/input.o src/config.o src/util.o src/type.o \
        src/theme.o src/draw.o src/font.o src/deco.o src/cursor.o src/menu.o \
-       src/sync.o src/motif.o src/icon.o src/ping.o src/shape.o
+       src/sync.o src/motif.o src/icon.o src/ping.o src/shape.o \
+       src/taskbar.o src/tray.o src/switcher.o
 
 BIN = w98wm
 

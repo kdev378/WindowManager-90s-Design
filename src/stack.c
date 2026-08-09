@@ -318,4 +318,11 @@ void stack_update_client_list(void)
 	xcb_change_property(wm.conn, XCB_PROP_MODE_REPLACE, wm.root,
 	                    atoms[ATOM_NET_CLIENT_LIST_STACKING], XCB_ATOM_WINDOW, 32,
 	                    n, buf);
+
+	/*
+	 * タスクバーのボタン列はクライアント一覧とスタック順から作るので、
+	 * ここを唯一の更新点にする (§4.8)。stack_apply() 経由で
+	 * フォーカス変更・レイズ・管理開始/終了のすべてがここを通る。
+	 */
+	taskbar_update();
 }

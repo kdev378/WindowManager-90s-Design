@@ -644,22 +644,24 @@ static void parse_stream(struct config *cfg, FILE *fp)
  * 設定ファイルの探索 (SPEC §8)
  * ================================================================== */
 
-static bool try_dir(char *out, size_t outsz, const char *dir, size_t dirlen)
+static bool try_dir_file(char *out, size_t outsz, const char *dir, size_t dirlen,
+                         const char *file)
 {
 	if (dirlen == 0)
 		return false;
 	int n = snprintf(out, outsz, "%.*s/%s/%s",
-	                 (int)dirlen, dir, WM_CONFIG_DIR, WM_CONFIG_FILE);
+	                 (int)dirlen, dir, WM_CONFIG_DIR, file);
 	if (n < 0 || (size_t)n >= outsz)
 		return false;
 	return access(out, R_OK) == 0;
 }
 
-static bool find_config_path(char *out, size_t outsz)
+/* XDG の探索順で <dir>/WM_CONFIG_DIR/<file> を探す */
+static bool find_in_config_dirs(char *out, size_t outsz, const char *file)
 {
 	const char *xdg_home = getenv("XDG_CONFIG_HOME");
 	if (xdg_home != NULL && xdg_home[0] != '\0') {
-		if (try_dir(out, outsz, xdg_home, strlen(xdg_home)))
+		if (try_dir_file(out, outsz, xdg_home, strlen(xdg_home), file))
 			return true;
 	} else {
 		const char *home = getenv("HOME");
@@ -667,7 +669,7 @@ static bool find_config_path(char *out, size_t outsz)
 			char buf[600];
 			int n = snprintf(buf, sizeof(buf), "%s/.config", home);
 			if (n > 0 && (size_t)n < sizeof(buf) &&
-			    try_dir(out, outsz, buf, strlen(buf)))
+			    try_dir_file(out, outsz, buf, strlen(buf), file))
 				return true;
 		}
 	}
@@ -679,17 +681,114 @@ static bool find_config_path(char *out, size_t outsz)
 		char *saveptr = NULL;
 		for (char *tok = strtok_r(dirs_buf, ":", &saveptr); tok != NULL;
 		     tok = strtok_r(NULL, ":", &saveptr)) {
-			if (try_dir(out, outsz, tok, strlen(tok)))
+			if (try_dir_file(out, outsz, tok, strlen(tok), file))
 				return true;
 		}
 	}
 
-	if (access(WM_SYSCONF_PATH, R_OK) == 0) {
-		snprintf(out, outsz, "%s", WM_SYSCONF_PATH);
-		return true;
+	{
+		char sys[768];
+		int n = snprintf(sys, sizeof(sys), "/etc/%s/%s", WM_CONFIG_DIR, file);
+		if (n > 0 && (size_t)n < sizeof(sys) && access(sys, R_OK) == 0) {
+			snprintf(out, outsz, "%s", sys);
+			return true;
+		}
 	}
 
 	return false;
+}
+
+static bool find_config_path(char *out, size_t outsz)
+{
+	return find_in_config_dirs(out, outsz, WM_CONFIG_FILE);
+}
+
+/* ================================================================== *
+ * スタートメニュー定義ファイル (SPEC §4.9)
+ *
+ * 1 行 1 項目。`ラベル | コマンド`、`-` だけの行はセパレータ。
+ * 空行と '#' で始まる行は無視する（config と同じ規則）。
+ * ================================================================== */
+
+static void parse_menu_line(struct config *cfg, char *line, int lineno)
+{
+	char *t = trim(line);
+	char *bar;
+	struct start_entry *e;
+
+	if (*t == '\0' || *t == '#')
+		return;
+	if (cfg->n_start >= WM_MAX_START_ENTRIES) {
+		ERR("menu: %d 行目: 項目が多すぎます（上限 %d）。以降を無視します",
+		    lineno, WM_MAX_START_ENTRIES);
+		return;
+	}
+
+	e = &cfg->start[cfg->n_start];
+
+	if (strcmp(t, "-") == 0) {
+		e->label = NULL;
+		e->cmd = NULL;
+		cfg->n_start++;
+		return;
+	}
+
+	bar = strchr(t, '|');
+	if (bar == NULL) {
+		ERR("menu: %d 行目: '|' がありません（無視します）: '%s'", lineno, t);
+		return;
+	}
+	*bar = '\0';
+
+	{
+		char *label = trim(t);
+		char *cmd = trim(bar + 1);
+
+		if (*label == '\0' || *cmd == '\0') {
+			ERR("menu: %d 行目: ラベルかコマンドが空です（無視します）", lineno);
+			return;
+		}
+		e->label = strdup(label);
+		e->cmd = strdup(cmd);
+		if (e->label == NULL || e->cmd == NULL) {
+			free(e->label);
+			free(e->cmd);
+			e->label = NULL;
+			e->cmd = NULL;
+			return;
+		}
+	}
+	cfg->n_start++;
+}
+
+static void load_start_menu(struct config *cfg)
+{
+	char path[768];
+	FILE *fp;
+	char line[512];
+	int lineno = 0;
+
+	if (!find_in_config_dirs(path, sizeof(path), WM_START_MENU_FILE))
+		return;   /* 無いのはエラーではない。組み込み項目だけで動く */
+
+	fp = fopen(path, "r");
+	if (fp == NULL) {
+		ERR("menu: '%s' を開けません: %s", path, strerror(errno));
+		return;
+	}
+	LOG("menu: '%s' を読み込みます", path);
+	while (fgets(line, sizeof line, fp) != NULL) {
+		lineno++;
+		if (strchr(line, '\n') == NULL && !feof(fp)) {
+			int ch;
+			ERR("menu: %d 行目: 行が長すぎます。スキップします", lineno);
+			while ((ch = fgetc(fp)) != EOF && ch != '\n')
+				;
+			continue;
+		}
+		parse_menu_line(cfg, line, lineno);
+	}
+	fclose(fp);
 }
 
 /* ================================================================== *
@@ -699,6 +798,7 @@ static bool find_config_path(char *out, size_t outsz)
 bool config_load(struct config *cfg)
 {
 	config_defaults(cfg);
+	load_start_menu(cfg);   /* menu ファイルは config とは独立に探す (§4.9) */
 
 	char path[768];
 	if (!find_config_path(path, sizeof(path)))
@@ -724,4 +824,12 @@ void config_free(struct config *cfg)
 		cfg->bindings[i].arg = NULL;
 	}
 	cfg->n_bindings = 0;
+
+	for (uint16_t i = 0; i < cfg->n_start; i++) {
+		free(cfg->start[i].label);
+		free(cfg->start[i].cmd);
+		cfg->start[i].label = NULL;
+		cfg->start[i].cmd = NULL;
+	}
+	cfg->n_start = 0;
 }

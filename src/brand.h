@@ -24,6 +24,8 @@
 /* 設定ファイルの探索に使うディレクトリ名（$XDG_CONFIG_HOME/<この名前>/config） */
 #define WM_CONFIG_DIR   "w98wm"
 #define WM_CONFIG_FILE  "config"
+/* スタートメニューの定義ファイル（$XDG_CONFIG_HOME/<WM_CONFIG_DIR>/menu, §4.9） */
+#define WM_START_MENU_FILE "menu"
 #define WM_SYSCONF_PATH "/etc/" WM_CONFIG_DIR "/" WM_CONFIG_FILE
 
 #define WM_VERSION      "0.1.0-dev"

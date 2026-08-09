@@ -249,42 +249,19 @@ void input_run_action(uint8_t action, const char *arg, struct client *c)
 			client_close(c);
 		break;
 
-	case ACT_SWITCH_NEXT: {
-		/* Phase 4: Win98 風タスクスイッチャ（アイコン列＋中央パネル）は
-		 * 未実装。ここでは MRU リストの次点へ直接フォーカスを移すだけの
-		 * 最小実装にとどめる（§6 の Alt+Esc 相当の挙動）。 */
-		struct client *next = wm.focused ? wm.focused->focus_next : wm.focus_list;
-		if (!next)
-			next = wm.focus_list;
-		if (next)
-			focus_set(next, XCB_CURRENT_TIME);
+	/*
+	 * Alt+Tab (§6)。switcher.c がパネルを出し、キーボードを grab して
+	 * 修飾キーが離されるまで選択を回す。すでに開いていれば 1 つ進める
+	 * （パネル表示中のキーは switcher_handle_event が直接受けるので、
+	 *  ここへ来るのは基本的に最初の 1 回だけ）。
+	 */
+	case ACT_SWITCH_NEXT:
+		switcher_begin(false);
 		break;
-	}
 
-	case ACT_SWITCH_PREV: {
-		/* MRU リストは focus_next の単方向リンクしか持たないため、
-		 * 「ひとつ手前」は先頭から辿って探す。Phase 4 のスイッチャ
-		 * パネルが実装されたら、そちらでリング操作をきちんと持つ。 */
-		struct client *prev = NULL;
-		if (wm.focused) {
-			for (struct client *p = wm.focus_list; p; p = p->focus_next) {
-				if (p->focus_next == wm.focused) {
-					prev = p;
-					break;
-				}
-			}
-			if (!prev) {
-				for (struct client *p = wm.focus_list; p; p = p->focus_next)
-					if (!p->focus_next)
-						prev = p;
-			}
-		} else {
-			prev = wm.focus_list;
-		}
-		if (prev)
-			focus_set(prev, XCB_CURRENT_TIME);
+	case ACT_SWITCH_PREV:
+		switcher_begin(true);
 		break;
-	}
 
 	case ACT_MAXIMIZE:
 		if (c)
@@ -346,12 +323,11 @@ void input_run_action(uint8_t action, const char *arg, struct client *c)
 		break;
 
 	case ACT_SHOW_DESKTOP:
-		/* Phase 4: _NET_SHOWING_DESKTOP のトグル・全ウィンドウの
-		 * 一時最小化は taskbar/desktop モジュール待ち。 */
+		ewmh_toggle_showing_desktop();
 		break;
 
 	case ACT_START_MENU:
-		/* Phase 4: Win98 風スタートメニューは未実装。 */
+		taskbar_open_start_menu();
 		break;
 
 	case ACT_EXEC:

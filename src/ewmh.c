@@ -467,6 +467,12 @@ static void showing_desktop_set(bool on)
 	stack_apply();
 }
 
+/* キーバインド (ACT_SHOW_DESKTOP) とスタートメニューからのトグル (§4.8) */
+void ewmh_toggle_showing_desktop(void)
+{
+	showing_desktop_set(!showing_desktop);
+}
+
 /* ================================================================== *
  * フォーカススティール防止 (SPEC §3.6)
  * ================================================================== */
@@ -478,7 +484,7 @@ void ewmh_set_demands_attention(struct client *c, bool on)
 	else
 		c->states &= ~(uint32_t)ST_DEMANDS_ATTENTION;
 	ewmh_set_wm_state(c);
-	/* Phase 4 でタスクバーのボタンを点滅させる。今は状態ビットのみ。 */
+	taskbar_update();   /* タスクボタンの点滅 (§4.8) */
 }
 
 bool ewmh_allow_activation(struct client *c, uint32_t source, xcb_timestamp_t t)

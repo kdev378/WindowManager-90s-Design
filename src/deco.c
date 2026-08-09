@@ -341,7 +341,8 @@ static void draw_border(const struct client *c, const struct deco_layout *L,
  * icccm.c が深度 1 なら CopyPlane、画面深度なら CopyArea で 16x16 の
  * icon_pix を作る規定なので、ここへ来る時点で常に画面深度である。
  */
-static void draw_icon(const struct client *c, const struct deco_layout *L)
+void deco_draw_icon_at(const struct client *c, xcb_drawable_t d,
+                       int16_t x, int16_t y, uint16_t sz)
 {
 	xcb_pixmap_t pix = c->icon_pix != XCB_PIXMAP_NONE ? c->icon_pix : c->wmh_icon_pix;
 	xcb_pixmap_t msk = c->icon_pix != XCB_PIXMAP_NONE ? c->icon_mask : c->wmh_icon_mask;
@@ -350,9 +351,9 @@ static void draw_icon(const struct client *c, const struct deco_layout *L)
 
 	if (pix == XCB_PIXMAP_NONE) {
 		/* §4.4.1 の最終フォールバック。内蔵の既定アイコン */
-		int gx = L->icon_x + (L->icon_sz - GLYPH_APPICON_SZ) / 2;
-		int gy = L->icon_y + (L->icon_sz - GLYPH_APPICON_SZ) / 2;
-		draw_glyph_bits(c->frame, (int16_t)gx, (int16_t)gy,
+		int gx = x + ((int)sz - GLYPH_APPICON_SZ) / 2;
+		int gy = y + ((int)sz - GLYPH_APPICON_SZ) / 2;
+		draw_glyph_bits(d, (int16_t)gx, (int16_t)gy,
 		                GLYPH_APPICON_SZ, GLYPH_APPICON_SZ,
 		                glyph_appicon, wm.cfg.color[THEME_DKSHADOW]);
 		return;
@@ -377,20 +378,24 @@ static void draw_icon(const struct client *c, const struct deco_layout *L)
 		 * XSync のアラーム属性でも同じ誤りをしたので、xcb の値リストは
 		 * 常にビット値順であることを意識すること。
 		 */
-		vals[0] = (uint32_t)(int32_t)L->icon_x;   /* CLIP_ORIGIN_X */
-		vals[1] = (uint32_t)(int32_t)L->icon_y;   /* CLIP_ORIGIN_Y */
+		vals[0] = (uint32_t)(int32_t)x;           /* CLIP_ORIGIN_X */
+		vals[1] = (uint32_t)(int32_t)y;           /* CLIP_ORIGIN_Y */
 		vals[2] = msk;                            /* CLIP_MASK     */
 		xcb_change_gc(wm.conn, gc,
 		              XCB_GC_CLIP_ORIGIN_X | XCB_GC_CLIP_ORIGIN_Y | XCB_GC_CLIP_MASK,
 		              vals);
 	}
-	xcb_copy_area(wm.conn, pix, c->frame, gc, 0, 0,
-	              (int16_t)L->icon_x, (int16_t)L->icon_y,
-	              (uint16_t)L->icon_sz, (uint16_t)L->icon_sz);
+	xcb_copy_area(wm.conn, pix, d, gc, 0, 0, x, y, sz, sz);
 	if (msk != XCB_PIXMAP_NONE) {
 		vals[0] = XCB_NONE;
 		xcb_change_gc(wm.conn, gc, XCB_GC_CLIP_MASK, vals);
 	}
+}
+
+static void draw_icon(const struct client *c, const struct deco_layout *L)
+{
+	deco_draw_icon_at(c, c->frame, (int16_t)L->icon_x, (int16_t)L->icon_y,
+	                  (uint16_t)L->icon_sz);
 }
 
 /*
