@@ -567,9 +567,45 @@ void event_dispatch(xcb_generic_event_t *ev)
 		return;
 
 	/* RandR (SPEC §5.3) */
+	/*
+	 * RandR (SPEC §5.3)。
+	 *
+	 * ★ **ScreenChangeNotify だけを見ていては足りない。**
+	 *   フレームバッファの大きさが変わらない再構成
+	 *   （モニタを同じ枠内で並べ替える、`xrandr --setmonitor` で
+	 *    RandR 1.5 のモニタ定義を差し替える等）は ScreenChange を出さず、
+	 *   RRNotify (CrtcChange / OutputChange / ResourceChange) しか来ない。
+	 *   wm.c はこの 3 つも select しているのに、ここで捌いていなかったため
+	 *   「イベントは届いているのに何も起きない」状態になっていた。
+	 *
+	 *   どの通知でも、やることは「モニタを取り直してパネルを作り直す」で
+	 *   同じ。変化が無ければ layout / taskbar 側が早期に戻る。
+	 */
+	if (wm.have_randr && type == wm.randr_base + XCB_RANDR_NOTIFY) {
+		/*
+		 * RRNotify は subCode で細分される。モニタ構成に関係しないもの
+		 * （出力プロパティの変更、プロバイダ関連）まで拾うと、
+		 * ドライバによっては頻繁に飛んできて、そのたびに
+		 * layout_update_monitors() の同期往復を払うことになる。
+		 */
+		uint8_t sub = ((xcb_randr_notify_event_t *)ev)->subCode;
+
+		if (sub != XCB_RANDR_NOTIFY_CRTC_CHANGE &&
+		    sub != XCB_RANDR_NOTIFY_OUTPUT_CHANGE &&
+		    sub != XCB_RANDR_NOTIFY_RESOURCE_CHANGE)
+			return;
+	}
+
 	if (wm.have_randr &&
-	    type == wm.randr_base + XCB_RANDR_SCREEN_CHANGE_NOTIFY) {
+	    (type == wm.randr_base + XCB_RANDR_SCREEN_CHANGE_NOTIFY ||
+	     type == wm.randr_base + XCB_RANDR_NOTIFY)) {
 		layout_update_monitors();
+		/*
+		 * パネルの作り直しはモニタ矩形の再計算の**後**。
+		 * これを忘れるとタスクバーが古い画面サイズのまま残り、
+		 * 画面が縮んだ場合は画面外へ出て触れなくなる (§5.3)。
+		 */
+		taskbar_reconfigure();
 		ewmh_update_desktop_props();
 		return;
 	}

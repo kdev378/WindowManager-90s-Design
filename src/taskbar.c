@@ -392,6 +392,66 @@ void taskbar_fini(void)
 	tb.ready = false;
 }
 
+/*
+ * 画面構成が変わったときにパネルを作り直す (SPEC §5.3)。
+ *
+ * RandR の SCREEN_CHANGE でモニタの矩形が変わっても、パネルは
+ * 生成時のジオメトリを抱えたままになる。画面が小さくなった場合は
+ * **パネルが画面外に出て操作不能**になり、strut の bottom_start_x /
+ * bottom_end_x も古い幅のまま残る。VM のウィンドウをリサイズすると
+ * 毎回これが起きるので、実機で 2 画面を用意しなくても踏む。
+ *
+ * ダブルバッファの Pixmap は幅が変わったときだけ作り直す
+ * （毎回作り直すとサーバ側の資源が無駄に回転する）。
+ */
+void taskbar_reconfigure(void)
+{
+	const struct metrics *m = theme_metrics();
+	struct monitor *mon;
+	uint32_t vals[4];
+	struct rect g;
+
+	if (!tb.ready || wm.n_monitors == 0)
+		return;
+
+	mon = &wm.monitors[0];
+	g.x = mon->geom.x;
+	g.h = m->taskbar_h;
+	g.w = mon->geom.w;
+	g.y = (int16_t)(mon->geom.y + mon->geom.h - g.h);
+
+	if (g.x == tb.geom.x && g.y == tb.geom.y &&
+	    g.w == tb.geom.w && g.h == tb.geom.h)
+		return;                      /* 変化なし */
+
+	tb.geom = g;
+
+	/* 値はビット値の昇順: X(1) Y(2) WIDTH(4) HEIGHT(8) */
+	vals[0] = (uint32_t)(int32_t)tb.geom.x;
+	vals[1] = (uint32_t)(int32_t)tb.geom.y;
+	vals[2] = tb.geom.w;
+	vals[3] = tb.geom.h;
+	xcb_configure_window(wm.conn, tb.win,
+		XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+		XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, vals);
+
+	if (tb.buf_w != tb.geom.w || tb.buf_h != tb.geom.h) {
+		if (tb.buf != XCB_PIXMAP_NONE)
+			xcb_free_pixmap(wm.conn, tb.buf);
+		tb.buf = xcb_generate_id(wm.conn);
+		xcb_create_pixmap(wm.conn, wm.depth, tb.buf, wm.root,
+		                  tb.geom.w, tb.geom.h);
+		tb.buf_w = tb.geom.w;
+		tb.buf_h = tb.geom.h;
+	}
+
+	tb.scroll = 0;               /* 幅が変わったのでスクロール位置は破棄 */
+	taskbar_update_strut();      /* 中で layout_update_workareas() が走る */
+	taskbar_update();
+	LOG("タスクバーを再配置 (%dx%d+%d+%d)",
+	    tb.geom.w, tb.geom.h, tb.geom.x, tb.geom.y);
+}
+
 xcb_window_t taskbar_strut_window(void)
 {
 	return tb.ready ? tb.win : XCB_WINDOW_NONE;

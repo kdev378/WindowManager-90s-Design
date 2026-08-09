@@ -37,117 +37,178 @@ make memcheck   # M0/M1/M20 が PASS か（arm64 の実測値が知りたい）
 
 ---
 
-## 1. GUI 環境を立てる
+## 1. 検証環境を作る
 
-CLI しか無いマシンで X アプリを動かして**手元から見る**方法。
-ディスプレイが刺さっていない前提（VPS や SBC への SSH）で書く。
+### 1.1 macOS + VM の場合（推奨）
 
-### 推奨: Xvnc（X サーバ + VNC が 1 プロセス）
+**Apple Silicon の Mac なら、ゲストが arm64 になるので §0 の確認も同時に済みます。**
 
-Xvfb は「描画するが誰にも見せない」ので、目視確認には VNC が要る。
-`Xvfb` + `x11vnc` の 2 段でも動くが、`Xvnc`（TigerVNC）なら 1 個で済む。
+#### ハイパーバイザ
+
+| | 評価 |
+| --- | --- |
+| **UTM** | 無料（GitHub 版）。Apple Silicon なら第一候補。Virtualization.framework と QEMU を選べる |
+| **VMware Fusion** | 個人利用は無料。ディスプレイまわりが素直で、ウィンドウのリサイズが RandR に伝わる |
+| **Parallels** | 一番快適だが有料 |
+| **VirtualBox** | **Apple Silicon 版は開発者プレビューで不安定。避けてください。** Intel Mac なら問題なし |
+
+Intel Mac の場合はゲストが x86_64 になるので、arm64 の確認にはなりません
+（それ自体は構いませんが、§0 の結果は「x86_64 でもう一度確認した」に留まります）。
+
+#### ディストリビューション
+
+**Debian 13 (trixie) の netinst arm64 を勧めます。** 理由:
+
+- インストーラでデスクトップ環境を**選ばない**構成にできる。
+  GNOME や KDE を入れると**別のウィンドウマネージャが同居する**ので、
+  検証としては邪魔になるだけ
+- Firefox / Chromium が **deb** で入る。Ubuntu はこの 2 つが snap で、
+  bare な WM の下では snap 側の都合による不具合が混ざる
+  （w98wm のせいでない現象の切り分けに時間を取られる）
+- 必要なパッケージが arm64 で一通り揃っている
+
+**Ubuntu Server + Xorg** でも動きます（上記の snap の点だけ承知しておけば十分）。
+
+**Arch Linux は arm64 だとお勧めしません。** Apple Silicon 上の VM で使うなら
+Arch Linux ARM になりますが、こちらは公式 ISO インストーラが無く
+rootfs の tarball を展開する方式なので、検証の本題に入る前の手間が増えます。
+x86_64 の Mac なら普通の Arch で構いません。
+
+#### インストール時の選択
+
+Debian のインストーラで「ソフトウェアの選択」まで来たら、
+
+- デスクトップ環境（GNOME 等）は**すべてチェックを外す**
+- 「標準システムユーティリティ」と「SSH サーバ」だけ残す
+
+#### X を入れる（デスクトップ環境は入れない）
 
 ```sh
-# Debian / Ubuntu
 sudo apt update
-sudo apt install -y tigervnc-standalone-server xterm x11-utils x11-xserver-utils \
-                    xdotool wmctrl imagemagick fonts-vlgothic
-
-# Fedora / RHEL
-sudo dnf install -y tigervnc-server xterm xorg-x11-utils xdotool wmctrl \
-                    ImageMagick vlgothic-fonts
-
-# Arch
-sudo pacman -S --needed tigervnc xterm xorg-xprop xorg-xwininfo xdotool wmctrl \
-                        imagemagick ttf-hanazono
+sudo apt install -y xserver-xorg xinit x11-utils x11-xserver-utils \
+                    xterm xdotool wmctrl imagemagick \
+                    fonts-vlgothic fonts-ipafont \
+                    build-essential pkg-config git \
+                    libxcb1-dev libxcb-randr0-dev libxcb-sync-dev \
+                    libxcb-keysyms1-dev libxcb-shape0-dev
 ```
 
-`fonts-vlgothic`（日本語フォント）は入れておいてください。
-**core ビルドの日本語タイトル表示は環境の X コアフォント次第**なので、
-ここが検証対象そのものになります。
+`fonts-vlgothic` / `fonts-ipafont` は日本語タイトルの検証に要ります。
+**core ビルドの日本語表示は環境の X コアフォント次第**なので、
+何が入っているかが検証結果そのものになります。
 
-パスワードを設定して起動:
+ビルドして、`.xinitrc` に w98wm だけを書きます:
 
 ```sh
-vncpasswd                      # 初回だけ。~/.vnc/passwd を作る
+git clone <このリポジトリ> ~/w98wm && cd ~/w98wm
+make
+make test                     # ここで 13 本すべて ok になるはず
 
-# WM を自分で起動したいので、セッションの自動起動は空にする
+cat > ~/.xinitrc <<'XINIT'
+# w98wm だけを唯一のクライアントとして起動する。
+# ここで他の WM やパネルを起動しないこと（検証の意味が無くなる）
+exec ~/w98wm/w98wm -v
+XINIT
+
+startx
+```
+
+VM のコンソール（UTM/Fusion のウィンドウ）にティール色のデスクトップと
+下端のタスクバーが出れば成功です。
+
+**逃げ道を先に用意しておいてください。** WM が固まったときのために、
+別マシンから SSH で入れる状態にしておくと安全です:
+
+```sh
+# 母艦の Mac から
+ssh ユーザ名@VMのIP
+pkill w98wm            # X ごとは落ちない。WM だけ差し替えられる
+```
+
+Ctrl+Alt+F2 で仮想端末に切り替えるのでも構いません
+（UTM/Fusion がそのキーをゲストへ渡す設定になっている必要があります）。
+
+#### VM ならではの利点: RandR が本物になる
+
+**VM のウィンドウをドラッグしてリサイズすると、ゲストの X に
+`RRScreenChangeNotify` が飛びます。** これは SPEC §5.3 のモニタ構成変更の
+経路そのものなので、実機で 2 枚のモニタを用意しなくても
+
+- 作業領域（`_NET_WORKAREA`）が追従するか
+- タスクバーが新しい幅に合わせて張り直されるか
+- 最大化中の窓が新しいサイズになるか
+
+を確認できます。**ぜひ試してください**（§4 の G に相当します）。
+
+### 1.2 ディスプレイの無いマシン（VPS / SBC）の場合
+
+VM ではなく手元に画面が無いマシンで試す場合は、VNC を挟みます。
+
+```sh
+sudo apt install -y tigervnc-standalone-server xterm x11-utils \
+                    x11-xserver-utils xdotool wmctrl imagemagick fonts-vlgothic
+
+vncpasswd                      # 初回だけ
 Xvnc :1 -geometry 1280x800 -depth 24 -rfbport 5901 \
         -rfbauth ~/.vnc/passwd -localhost &
-```
 
-`-localhost` を付けているので、手元のマシンから **SSH トンネル**で繋ぎます
-（VNC を直接インターネットに晒さないため）:
-
-```sh
-# 手元のマシンで
-ssh -L 5901:localhost:5901 ユーザ名@サーバ
-```
-
-あとは手元の VNC クライアント（macOS なら Finder の「サーバへ接続」で
-`vnc://localhost:5901`、Windows なら TigerVNC Viewer / RealVNC）で
-`localhost:5901` へ接続。
-
-灰色または黒の何も無い画面が出れば成功です。ここに WM を載せます:
-
-```sh
-DISPLAY=:1 ./w98wm -v
-```
-
-`-v` を付けると採用されたフォントや管理したウィンドウがログに出ます。
-**このログは不具合報告のときに一番役に立つので、必ず取っておいてください。**
-
-```sh
 DISPLAY=:1 ./w98wm -v 2>&1 | tee /tmp/w98wm.log
 ```
 
-### 解像度を変えたいとき
-
-`Xvnc` は起動時の `-geometry` で固定です。
-マルチモニタや HiDPI（`scale=2`）を試すときは Xvnc を立て直してください。
+`-localhost` を付けてあるので、手元から SSH トンネル経由で繋ぎます
+（VNC を直接インターネットに晒さないため）:
 
 ```sh
-# HiDPI 相当の検証
-Xvnc :1 -geometry 2560x1440 -depth 24 ... &
+ssh -L 5901:localhost:5901 ユーザ名@サーバ
+# → VNC クライアントで localhost:5901
+```
+
+こちらの経路では**画面サイズが固定**になるので、RandR の検証はできません。
+
+### 1.3 HiDPI を試す
+
+```sh
 mkdir -p ~/.config/w98wm
 echo 'scale=2' >> ~/.config/w98wm/config
 ```
 
-### ディスプレイが刺さっている場合（実機の X）
-
-こちらのほうが「本物」の検証になります（RandR が本物になるため）。
-
-```sh
-sudo apt install -y xserver-xorg xinit xterm
-echo 'exec /path/to/w98wm -v' > ~/.xinitrc
-startx -- :0
-```
-
-Ctrl+Alt+F2 などで仮想端末を切り替えられるようにしてから試してください
-（WM が固まったときの逃げ道。`pkill w98wm` で戻せます）。
+VM の解像度を上げてから（または Retina の Mac で VM を全画面にしてから）
+起動し直してください。
 
 ---
 
 ## 2. 検証用アプリを入れる
 
 SPEC §7.1 の一覧。**arm64 でパッケージがあるものだけ**挙げます。
+デスクトップ環境は入れないので、アプリだけを個別に入れます
+（`gedit` などが GNOME の一部を引きずってきますが、
+**別の WM が入らない限り**問題ありません）。
 
 ```sh
 sudo apt install -y \
   firefox-esr `# Gecko` \
   chromium `# Blink` \
   gedit `# GTK3` \
-  gnome-text-editor `# GTK4` \
-  vlc `# Qt5、全画面の検証にも使う` \
-  libreoffice-writer `# 巨大な GTK/VCL アプリ` \
+  gnome-text-editor `# GTK4 (CSD の検証に必須)` \
+  vlc `# Qt5。全画面と aspect hints の検証にも使う` \
+  libreoffice-writer `# 巨大な VCL アプリ。リサイズ追従が一番出る` \
   openjdk-17-jdk `# Java/Swing。§3 参照` \
-  pavucontrol `# GTK3 の小さいダイアログ` \
-  xfce4-notifyd `# 通知ウィンドウ (_NET_WM_WINDOW_TYPE_NOTIFICATION)`
+  pavucontrol `# GTK3 の小さいダイアログ`
 ```
+
+インストール中に「デスクトップ環境を一緒に入れるか」を聞かれることは
+ありませんが、`apt install` の依存に **`*-session` や別の WM が入っていないか**
+だけ目を通してください（入っても `.xinitrc` で起動しなければ実害はありません）。
 
 **Electron** は arm64 のパッケージが揃いにくいので、無理なら飛ばして構いません
 （Chromium で Blink 側の経路はだいたい踏めます）。試すなら VSCodium が arm64 の
 `.deb` を出しています。
+
+**Ubuntu を選んだ場合**: `firefox` と `chromium` は snap になります。
+bare な WM の下でも動きますが、起動が遅く、ファイル選択ダイアログが
+xdg-desktop-portal 経由になるなど**挙動が deb 版と変わります**。
+そこで出た不具合は w98wm のせいとは限らないので、
+切り分けのために `firefox-esr` の deb か、Debian での再確認を勧めます。
 
 **トレイアイコンを出す常駐アプリ**が欲しい場合、arm64 で入りやすいのは:
 
@@ -253,7 +314,30 @@ DISPLAY=:1 java tools/SwingTest.java
 **それが分かること自体が成果**なので、`--print-font` の出力と一緒に報告してください。
 実用に耐えないようなら `make XFT=1` の xft ビルドを整備します。
 
-### G. マルチモニタ（実機で 2 画面ある場合のみ）
+### G. モニタ構成の変化（**ここを最優先で見てほしい**）
+
+**VM のウィンドウをドラッグしてリサイズする**と、ゲストの X に
+RandR の変更通知が飛びます（SPEC §5.3 の経路そのもの）。
+
+> **ここは修正したばかりで未検証です。**
+> Phase 4 の検証中に「RandR の再構成でタスクバーが古い画面サイズのまま
+> 取り残される」「`RRNotify` を受け取っていながら捨てていた」の 2 つを
+> 見つけて直しましたが、**Xvfb は RandR の変更通知を一切配送しない**
+> （4 種すべて select したプローブで 1 件も届かないことを確認済み）ため、
+> こちらの環境では動作を確認できていません。
+> VM ならウィンドウを掴んでリサイズするだけで踏めるので、
+> ここが一番「新しいバグが出そう」な場所です。
+> 直っていない場合、画面を小さくすると**タスクバーが画面外へ出て
+> 触れなくなる**はずです（`pkill w98wm` で復帰できます）。
+
+| 手順 | 期待 |
+| --- | --- |
+| VM のウィンドウを大きく／小さくリサイズ | タスクバーが新しい幅いっぱいに張り直る |
+| そのあと `xprop -root _NET_WORKAREA` | 新しい画面サイズから strut を引いた値になっている |
+| 最大化中の窓があるままリサイズ | 新しい作業領域いっぱいに追従する |
+| 画面を極端に小さく（例: 640x480）してから戻す | 窓が画面外に取り残されない |
+
+実機で 2 画面ある場合はこちらも:
 
 | 手順 | 期待 |
 | --- | --- |

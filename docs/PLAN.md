@@ -258,6 +258,21 @@ Phase 4 で見つけて直した既存の不具合:
   `120-tray-xembed.sh` の `kill -9` の項で検出。
 - **メモリ計測が別プロセス間の差を取っていた**ため、限界費用のゲートが
   雑音を測っていた。詳細は `docs/MEMORY.md` の Phase 4 の節。
+- **RandR の再構成でタスクバーが取り残されていた** (§5.3)。`event.c` は
+  `RRScreenChangeNotify` で `layout_update_monitors()` を呼ぶだけで、
+  パネルのジオメトリには一切触れていなかった。画面が縮むと
+  **パネルが画面外へ出て操作不能**になる。`taskbar_reconfigure()` を追加。
+- **`RRNotify` を捨てていた。** `wm.c` は CRTC / Output の変更通知も
+  select しているのに、`event.c` は `RRScreenChangeNotify` しか捌いて
+  いなかった。フレームバッファの大きさが変わらない再構成
+  （同じ枠内でのモニタの並べ替え、`xrandr --setmonitor`）は
+  `ScreenChange` を出さないため、**イベントは届いているのに何も起きない**
+  状態だった。`RESOURCE_CHANGE` も select に足し、subCode で絞って捌くようにした。
+
+  **この 2 つは未検証**である。Xvfb は RandR の変更通知を一切配送しない
+  （4 種すべて select したプローブで 1 件も届かないことを確認）ため、
+  この環境では踏めない。**VM のウィンドウをリサイズすれば即座に踏める**
+  ので、`docs/MANUAL-TEST.md` §4-G を最優先で見てほしい。
 
 ---
 

@@ -27,10 +27,18 @@ static void query_extensions(void)
 	if (ext && ext->present) {
 		wm.have_randr = true;
 		wm.randr_base = ext->first_event;
+		/*
+		 * RESOURCE_CHANGE も要る (RandR 1.4)。
+		 * `xrandr --setmonitor` のような RandR 1.5 のモニタ定義の変更は
+		 * ScreenChange も CrtcChange も出さず、これだけが飛ぶ。
+		 * 選んだ通知は event.c で**全部**捌くこと。選んでおいて
+		 * 捌かないと「イベントは届いているのに何も起きない」になる。
+		 */
 		xcb_randr_select_input(wm.conn, wm.root,
 			XCB_RANDR_NOTIFY_MASK_SCREEN_CHANGE |
 			XCB_RANDR_NOTIFY_MASK_CRTC_CHANGE |
-			XCB_RANDR_NOTIFY_MASK_OUTPUT_CHANGE);
+			XCB_RANDR_NOTIFY_MASK_OUTPUT_CHANGE |
+			XCB_RANDR_NOTIFY_MASK_RESOURCE_CHANGE);
 	} else {
 		wm.have_randr = false;
 		ERR("RandR が無い。マルチモニタ非対応で続行する (SPEC §5.3)");

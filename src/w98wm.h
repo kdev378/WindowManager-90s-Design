@@ -701,8 +701,14 @@ void taskbar_draw(const xcb_rectangle_t *clip);
 void taskbar_tick(uint64_t now_ms); /* 時計の更新と点滅 */
 bool taskbar_handle_event(xcb_generic_event_t *ev);  /* 処理したら true */
 bool taskbar_owns(xcb_window_t w);
-/* strut を張り直す。モニタ構成やオートハイドの変化で呼ぶ */
+/* strut を張り直す。オートハイドの変化で呼ぶ */
 void taskbar_update_strut(void);
+/*
+ * モニタ構成が変わったときにパネルの位置と大きさを作り直す (§5.3)。
+ * RandR の SCREEN_CHANGE から必ず呼ぶこと。呼ばないとパネルが
+ * 古い画面サイズのまま取り残される（画面が縮むと操作不能になる）。
+ */
+void taskbar_reconfigure(void);
 /*
  * strut を載せているパネルウィンドウ。無効なら XCB_WINDOW_NONE。
  * タスクバーは override-redirect でクライアント一覧に載らないため、
