@@ -206,11 +206,17 @@ if [ "$CLIENTS" -eq 2 ]; then
 	CLIENT_PIDS="$CLIENT_PIDS $p2"
 fi
 
-# xterm がマップされ WM に管理されるまで待つ (xdotool があれば使う。無ければ固定待機)
-if command -v xdotool >/dev/null 2>&1; then
+# xterm がマップされ WM に管理されるまで待つ。
+#
+# 数えるのは **_NET_CLIENT_LIST**。`xdotool search --onlyvisible --name '.*'`
+# は名前のある可視ウィンドウを無差別に返すので、xterm の内部ウィンドウや
+# w98wm 自身のタスクバー・トレイまで数に入り、実際には目的の枚数に
+# 届いていないのに先へ進んでしまう。
+if command -v xprop >/dev/null 2>&1; then
 	j=0
-	while [ $j -lt 50 ]; do
-		n=$(xdotool search --onlyvisible --name '.*' 2>/dev/null | wc -l | tr -d ' ')
+	while [ $j -lt 80 ]; do
+		n=$(xprop -display "$DISPLAY" -root _NET_CLIENT_LIST 2>/dev/null |
+			tr ',' '\n' | grep -c '0x' || echo 0)
 		if [ "${n:-0}" -ge "$CLIENTS" ] 2>/dev/null; then
 			break
 		fi

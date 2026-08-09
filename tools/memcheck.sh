@@ -184,25 +184,78 @@ measure_pd() {
 }
 
 run_stress_cycles() {
-	# M20h: 1時間に 500 回の開閉/移動/リサイズを均等配分して実行する。
-	total=500
-	seconds=3600
-	interval=$(awk "BEGIN { printf \"%.3f\", $seconds / $total }")
-	have_xdotool=0
-	command -v xdotool >/dev/null 2>&1 && have_xdotool=1
+	#
+	# M20h: 1 時間かけて 500 回の開閉/移動/リサイズを行い、常駐量が
+	# 増え続けないことを見る (SPEC §9.1)。
+	#
+	# ★ 対象は **_NET_CLIENT_LIST から取る**。
+	#
+	#   以前はここで `xdotool search --onlyvisible --name '.*'` を使って
+	#   いたが、これは名前のある可視ウィンドウを**無差別に**返す。
+	#   Phase 4 でタスクバーとトレイに _NET_WM_NAME を付けた結果、
+	#   これらが候補に混ざり、`xdotool windowkill` が実行された。
+	#   windowkill は XKillClient なので、**そのウィンドウを所有する
+	#   クライアント = WM 自身の X 接続が切られる**。
+	#   結果、計測開始から 1 分で WM が死に、残り 59 分を
+	#   死んだプロセスに対して回し続けて "N/A" を出していた。
+	#
+	#   _NET_CLIENT_LIST には WM 自身のパネルは載らない
+	#   (override-redirect なので管理下に入らない)。ここを唯一の
+	#   取得元にすれば、原理的に自分を殺せない。
+	#
+	# ★ WM の生死を毎周確認する。死んでいたら即座に打ち切る。
+	#   1 時間待ってから "測れませんでした" と言うのは無意味。
+	#
+	# ★ 間隔は**壁時計基準**にする。sleep を固定にすると
+	#   xdotool の所要時間がそのまま上積みされ、実測で 1 時間の予定が
+	#   2 時間を超えていた。
+	#
+	# 動作確認用に短縮できるようにしておく。既定は SPEC §9.1 の 1 時間 / 500 回。
+	#   M20H_SECONDS=120 M20H_CYCLES=40 sh tools/memcheck.sh --long
+	total=${M20H_CYCLES:-500}
+	seconds=${M20H_SECONDS:-3600}
+	started=$(date +%s)
+
+	if ! command -v xdotool >/dev/null 2>&1; then
+		echo "警告: xdotool が無いのでストレスをかけずに 1 時間待機します。" >&2
+	fi
 
 	idx=0
+	last_report=0
 	while [ $idx -lt $total ]; do
-		if [ "$have_xdotool" -eq 1 ]; then
-			slot=$(((idx % 20) + 1))
-			win=$(xdotool search --onlyvisible --name '.*' 2>/dev/null | sed -n "${slot}p")
+		if ! kill -0 "$WM_PID" 2>/dev/null; then
+			echo "エラー: ストレス中に WM が終了しました (${idx} 周目)。" >&2
+			echo "        M20h は測定できません。ログ: $WORKROOT/wm_1.log" >&2
+			STRESS_ABORTED=1
+			return 1
+		fi
+
+		if command -v xdotool >/dev/null 2>&1; then
+			# 管理下のクライアントだけを対象にする
+			wins=$(xprop -display "$DISPLAY" -root _NET_CLIENT_LIST 2>/dev/null |
+				sed 's/.*# *//' | tr ',' ' ')
+			set -- $wins
+			n=$#
+			if [ "$n" -gt 0 ]; then
+				slot=$(((idx % n) + 1))
+				win=$(echo "$wins" | tr ' ' '\n' | sed -n "${slot}p")
+			else
+				win=""
+			fi
+
 			if [ -n "$win" ]; then
 				case $((idx % 3)) in
 				0)
-					xdotool windowmove --sync "$win" $(((idx * 7) % 800)) $(((idx * 5) % 600)) >/dev/null 2>&1 || true
+					# --sync は付けない。WM がサイズヒントで丸めると
+					# 要求値に一致せず、xdotool が待ち続ける。
+					xdotool windowmove "$win" \
+						$(((idx * 7) % 800)) $(((idx * 5) % 600)) \
+						>/dev/null 2>&1 || true
 					;;
 				1)
-					xdotool windowsize --sync "$win" $((300 + (idx % 200))) $((200 + (idx % 150))) >/dev/null 2>&1 || true
+					xdotool windowsize "$win" \
+						$((300 + (idx % 200))) $((200 + (idx % 150))) \
+						>/dev/null 2>&1 || true
 					;;
 				2)
 					xdotool windowkill "$win" >/dev/null 2>&1 || true
@@ -212,9 +265,27 @@ run_stress_cycles() {
 				esac
 			fi
 		fi
-		sleep "$interval"
+
 		idx=$((idx + 1))
+
+		# 壁時計で「idx / total まで進んでいるべき時刻」まで待つ
+		target=$((started + seconds * idx / total))
+		now=$(date +%s)
+		if [ "$now" -lt "$target" ]; then
+			sleep $((target - now))
+		fi
+
+		# 5 分ごとに進捗を出す (無言で 1 時間黙るのは追跡できない)
+		elapsed=$(( $(date +%s) - started ))
+		report_every=$((seconds / 12))
+		[ "$report_every" -lt 10 ] && report_every=10
+		if [ $((elapsed / report_every)) -gt "$last_report" ]; then
+			last_report=$((elapsed / report_every))
+			pd_now=$(measure_pd "$WM_PID" 2>/dev/null || echo "?")
+			echo "   ... ${elapsed}s / ${seconds}s  ${idx}/${total} 周  Private_Dirty=${pd_now}KB" >&2
+		fi
 	done
+	return 0
 }
 
 echo "=== w98wm memcheck (SPEC §9.1) ==="
@@ -227,6 +298,7 @@ M1_KB=""
 M20_KB=""
 M20H_KB=""
 MEASURED_N=0
+STRESS_ABORTED=0
 
 # --- M0: ウィンドウ 0 枚・タスクバー無効 ---
 echo "-- M0 を計測中 (タスクバー無効) --"
@@ -283,9 +355,12 @@ tray=true" 1; then
 	M20_KB=$(measure_pd "$WM_PID") || M20_KB=""
 
 	if [ "$LONG" -eq 1 ] && [ -n "$M20_KB" ]; then
-		echo "-- M20h を計測中 (1時間 + 500 サイクル。しばらくお待ちください) --" >&2
-		run_stress_cycles
-		M20H_KB=$(measure_pd "$WM_PID") || M20H_KB=""
+		echo "-- M20h を計測中 (1時間 + 500 サイクル。5 分ごとに進捗を出します) --" >&2
+		if run_stress_cycles; then
+			M20H_KB=$(measure_pd "$WM_PID") || M20H_KB=""
+		else
+			M20H_KB=""
+		fi
 	fi
 fi
 for p in $XTERM_PIDS; do

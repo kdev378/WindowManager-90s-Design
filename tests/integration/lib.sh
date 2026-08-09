@@ -44,12 +44,36 @@ fi
 
 _LIB_PIDS=""
 _LIB_CLEANED_UP=0
+#
+# 後始末。**SIGTERM のあと必ず SIGKILL まで落とす。**
+#
+# SIGTERM を送って親シェルがすぐ終了すると、まだ終了処理中の子
+# (特に Xvfb) が取り残される。実際にこのセッションで w98wm が 17 個、
+# Xvfb が 24 個生き残っていた。CI で繰り返すと積み上がる。
+#
 _lib_cleanup() {
 	[ "$_LIB_CLEANED_UP" -eq 1 ] && return 0
 	_LIB_CLEANED_UP=1
+
 	for p in $_LIB_PIDS; do
 		kill "$p" 2>/dev/null || true
 	done
+
+	# 終了を少し待ってから、残っているものに止めを刺す
+	i=0
+	while [ $i -lt 20 ]; do
+		alive=0
+		for p in $_LIB_PIDS; do
+			kill -0 "$p" 2>/dev/null && alive=1
+		done
+		[ "$alive" -eq 0 ] && break
+		sleep 0.1
+		i=$((i + 1))
+	done
+	for p in $_LIB_PIDS; do
+		kill -9 "$p" 2>/dev/null || true
+	done
+
 	wait 2>/dev/null || true
 }
 trap _lib_cleanup EXIT INT TERM
@@ -123,6 +147,42 @@ wait_for_window() {
 			echo "$win"
 			return 0
 		fi
+		sleep 0.2
+		i=$((i + 1))
+	done
+	return 1
+}
+
+#
+# wait_for_managed_window <WM_NAME に含まれる文字列> [タイムアウト秒(既定10)]
+#
+# **WM の管理下に入った**ウィンドウ (= _NET_CLIENT_LIST に載っているもの)
+# だけを対象に、名前で引く。見つかれば 10 進のウィンドウ ID を返す。
+#
+# ★ 名前で引くのに xdotool search を使ってはいけない。
+#   xdotool search はルートの子を無差別に走査するので、
+#   アプリが作る表に出ない補助ウィンドウ (Java がいくつも作る) や、
+#   **w98wm 自身のタスクバー/トレイ** まで返す。
+#   前者は 130 で WM_HINTS が読めない誤検出を、
+#   後者は memcheck の M20h で `xdotool windowkill` が
+#   WM 自身の X 接続を切って計測を丸ごと壊す事故を起こした。
+#
+wait_for_managed_window() {
+	pattern="$1"
+	tmo="${2:-10}"
+	max=$((tmo * 5))
+	i=0
+	while [ $i -lt $max ]; do
+		for id in $(xprop -display "$DISPLAY" -root _NET_CLIENT_LIST 2>/dev/null |
+				sed 's/.*# *//' | tr ',' ' '); do
+			nm=$(xprop -display "$DISPLAY" -id "$id" WM_NAME _NET_WM_NAME 2>/dev/null || true)
+			case "$nm" in
+			*"$pattern"*)
+				printf '%d\n' "$id"
+				return 0
+				;;
+			esac
+		done
 		sleep 0.2
 		i=$((i + 1))
 	done

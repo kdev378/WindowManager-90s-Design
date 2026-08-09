@@ -53,35 +53,10 @@ java -Djava.awt.headless=false -cp "$TMP/classes" SwingTest \
 JAVA_PID=$!
 _LIB_PIDS="$_LIB_PIDS $JAVA_PID"
 
-#
-# ★ 窓の特定に xdotool search の先頭を使ってはいけない。
-#   Java は表に出ない補助ウィンドウをいくつか作るので、名前で引くと
-#   そちらが先に当たる（実際に当たって WM_HINTS が読めず、
-#   「この JDK は対象外」という誤った skip になっていた）。
-#   **WM が管理下に入れた窓**、つまり _NET_CLIENT_LIST に載っていて
-#   かつ名前が一致するものを選ぶ。
-#
-find_managed_swing() {
-	for id in $(xprop -display "$DISPLAY" -root _NET_CLIENT_LIST 2>/dev/null |
-			sed 's/.*# *//' | tr ',' ' '); do
-		name=$(xprop -display "$DISPLAY" -id "$id" WM_NAME _NET_WM_NAME 2>/dev/null || true)
-		case "$name" in
-		*Swing*)
-			printf '%d\n' "$id"
-			return 0
-			;;
-		esac
-	done
-	return 1
-}
-
-win=""
-i=0
-while [ $i -lt 125 ]; do
-	win=$(find_managed_swing) && [ -n "$win" ] && break
-	sleep 0.2
-	i=$((i + 1))
-done
+# 管理下に入った Swing の窓を待つ。
+# xdotool search を使わない理由は lib.sh の wait_for_managed_window を参照
+# (Java は表に出ない補助ウィンドウを作るので、名前で引くと先にそちらが当たる)。
+win=$(wait_for_managed_window "Swing" 25) || win=""
 [ -n "$win" ] ||
 	fail "Swing の窓が管理下に入りませんでした: $(tail -5 "$TMP/app.err" 2>/dev/null)"
 sleep 2

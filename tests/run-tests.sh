@@ -36,16 +36,58 @@ pass=0
 fail=0
 skip=0
 
+#
+# テストが取り残したサーバプロセスを落とす。
+#
+# lib.sh の trap も後始末をするが、それだけでは取りこぼしが出る
+# （実測で 13 本 x 2 回の実行後に Xvfb が 6 個、w98wm が 4 個、
+#   いずれも PPID=1 で孤児化した状態で残っていた）。
+# CI で繰り返すと積み上がって最終的にメモリを食い潰すので、
+# ランナ側でも網を張る。
+#
+# 対象は **Xvfb と w98wm だけ**にする。xterm まで落とすと、
+# 同時に走っているかもしれない memcheck --long の被験ウィンドウを
+# 巻き添えにする（Xvfb を落とせばぶら下がる xterm も接続断で終わる）。
+#
+_snapshot_servers() {
+	{ pgrep -x Xvfb; pgrep -x w98wm; } 2>/dev/null | sort -u
+}
+
+_reap_leaked_servers() {
+	before_f="$1"
+	after_f=$(mktemp)
+	_snapshot_servers >"$after_f"
+
+	# before に無くて after にある = このテストが取り残した
+	leaked=$(grep -vxF -f "$before_f" "$after_f" 2>/dev/null || true)
+	rm -f "$after_f"
+	[ -z "$leaked" ] && return 0
+
+	for p in $leaked; do
+		kill "$p" 2>/dev/null || true
+	done
+	sleep 0.3
+	for p in $leaked; do
+		kill -9 "$p" 2>/dev/null || true
+	done
+}
+
 run_one() {
 	path="$1"
 	name=$(basename "$path")
 	n=$((n + 1))
 	logf=$(mktemp)
+	before_f=$(mktemp)
+	_snapshot_servers >"$before_f"
+
 	if [ -n "$TIMEOUT_BIN" ]; then
 		$TIMEOUT_BIN "$path" >"$logf" 2>&1 && rc=0 || rc=$?
 	else
 		"$path" >"$logf" 2>&1 && rc=0 || rc=$?
 	fi
+
+	_reap_leaked_servers "$before_f"
+	rm -f "$before_f"
 
 	if [ "$rc" -eq 0 ]; then
 		echo "ok $n - $name"
