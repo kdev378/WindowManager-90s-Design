@@ -29,7 +29,7 @@ core ビルドでの日本語タイトル表示は、環境にある X コアフ
 
 ```
 make          # ビルド (依存: libxcb, xcb-randr, xcb-sync, xcb-keysyms, xcb-shape)
-make test     # Xvfb 上で結合テスト (13 本)
+make test     # Xvfb 上で結合テスト (16 本)
 make memcheck # メモリ実測 (SPEC §9.1)
 ```
 
@@ -50,10 +50,11 @@ make memcheck # メモリ実測 (SPEC §9.1)
 
 | 指標 | 実測 | 目標 | 判定 |
 | --- | --- | --- | --- |
-| Private_Dirty (0 窓・タスクバー無効) | 360 KB | < 400 KB | PASS |
-| Private_Dirty (0 窓・タスクバー/トレイ有効) | 364 KB | < 550 KB | PASS |
-| Private_Dirty (20 窓) | 384–396 KB | < 1024 KB | PASS |
-| 窓あたりの限界費用 | 1.0–1.4 KB | < 2 KB | PASS |
+| Private_Dirty (0 窓・タスクバー無効) | 248 KB | < 400 KB | PASS |
+| Private_Dirty (0 窓・タスクバー/トレイ有効) | 252 KB | < 550 KB | PASS |
+| Private_Dirty (20 窓) | 276 KB | < 1024 KB | PASS |
+| 窓あたりの限界費用 | 1.2 KB | < 2 KB | PASS |
+| 1 時間 + 500 回の開閉/移動/リサイズ後 | 272 KB (**−4 KB**) | 増分 < 32 KB | PASS |
 
 **絶対値は起動ごとに 250–370 KB の幅で揺れます**（glibc のアリーナ初期状態と ASLR による）。
 Phase 4 で計測方法の欠陥（限界費用を別プロセス間の差で測っていた）を直したため、
