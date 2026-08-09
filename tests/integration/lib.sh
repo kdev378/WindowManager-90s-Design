@@ -189,6 +189,39 @@ wait_for_managed_window() {
 	return 1
 }
 
+#
+# wait_for_managed_window_by_pid <PID> [タイムアウト秒(既定10)]
+#
+# _NET_WM_PID で照合して、管理下に入ったウィンドウを待つ。
+#
+# ★ **xterm を名前で探してはいけない。**
+#   `xterm -T なまえ` で付けた WM_NAME は、中のシェルが起動直後に
+#   エスケープシーケンスで上書きする（プロンプトの "user@host: cwd" になる）。
+#   名前で待つと永久に見つからず、「WM が応答しない」という誤った
+#   結論に化ける（実際に 150 でそう見えた）。
+#   PID なら上書きされない。
+#
+wait_for_managed_window_by_pid() {
+	want="$1"
+	tmo="${2:-10}"
+	max=$((tmo * 5))
+	i=0
+	while [ $i -lt $max ]; do
+		for id in $(xprop -display "$DISPLAY" -root _NET_CLIENT_LIST 2>/dev/null |
+				sed 's/.*# *//' | tr ',' ' '); do
+			p=$(xprop -display "$DISPLAY" -id "$id" _NET_WM_PID 2>/dev/null |
+				sed 's/.*= *//' | tr -d ' ')
+			if [ -n "$p" ] && [ "$p" = "$want" ]; then
+				printf '%d\n' "$id"
+				return 0
+			fi
+		done
+		sleep 0.2
+		i=$((i + 1))
+	done
+	return 1
+}
+
 # get_root_window: ルートウィンドウID (16進, 0x...) を返す。xwininfo が無ければ空文字。
 get_root_window() {
 	command -v xwininfo >/dev/null 2>&1 || {

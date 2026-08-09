@@ -319,9 +319,12 @@ stop_wm
 #   1 つのプロセスで「0 窓 → 20 窓」の差を取れば、その差は本当に
 #   窓が増えた分だけになる。M0 だけは taskbar=false の別設定が要るので
 #   独立した起動のまま（こちらは絶対値の判定なので差の雑音は効かない）。
+# grep -c は一致 0 でも "0" を出力し、終了コードだけが 1 になる。
+# ここで `|| echo 0` を付けると 0 件のときに "0\n0" の 2 行が返り、
+# 呼び出し側の [ "$n" -ge 20 ] が "Illegal number" で落ちる（実際に踏んだ）。
 count_managed() {
 	xprop -display "$DISPLAY" -root _NET_CLIENT_LIST 2>/dev/null |
-		tr ',' '\n' | grep -c '0x' || echo 0
+		tr ',' '\n' | grep -c '0x' || true
 }
 
 echo "-- M1 / M20 を計測中 (同一プロセス。タスクバー/トレイ有効) --"

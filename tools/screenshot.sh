@@ -216,7 +216,7 @@ if command -v xprop >/dev/null 2>&1; then
 	j=0
 	while [ $j -lt 80 ]; do
 		n=$(xprop -display "$DISPLAY" -root _NET_CLIENT_LIST 2>/dev/null |
-			tr ',' '\n' | grep -c '0x' || echo 0)
+			tr ',' '\n' | grep -c '0x' || true)
 		if [ "${n:-0}" -ge "$CLIENTS" ] 2>/dev/null; then
 			break
 		fi
