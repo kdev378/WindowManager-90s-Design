@@ -367,11 +367,21 @@ static void draw_icon(const struct client *c, const struct deco_layout *L)
 	gc = icon_gc;
 
 	if (msk != XCB_PIXMAP_NONE) {
-		vals[0] = msk;
-		vals[1] = (uint32_t)(int32_t)L->icon_x;
-		vals[2] = (uint32_t)(int32_t)L->icon_y;
+		/*
+		 * **値リストはマスクのビット値の昇順**で並べること。
+		 *   CLIP_ORIGIN_X(0x20000) < CLIP_ORIGIN_Y(0x40000) < CLIP_MASK(0x80000)
+		 * マスクに書いた順ではない。ここを取り違えると、サーバは
+		 * CLIP_MASK として icon_y の値を Pixmap ID と解釈し、
+		 * BadPixmap を出しながらアイコンのクリップも効かなくなる
+		 * （実際にこの誤りで毎回 BadPixmap が出ていた）。
+		 * XSync のアラーム属性でも同じ誤りをしたので、xcb の値リストは
+		 * 常にビット値順であることを意識すること。
+		 */
+		vals[0] = (uint32_t)(int32_t)L->icon_x;   /* CLIP_ORIGIN_X */
+		vals[1] = (uint32_t)(int32_t)L->icon_y;   /* CLIP_ORIGIN_Y */
+		vals[2] = msk;                            /* CLIP_MASK     */
 		xcb_change_gc(wm.conn, gc,
-		              XCB_GC_CLIP_MASK | XCB_GC_CLIP_ORIGIN_X | XCB_GC_CLIP_ORIGIN_Y,
+		              XCB_GC_CLIP_ORIGIN_X | XCB_GC_CLIP_ORIGIN_Y | XCB_GC_CLIP_MASK,
 		              vals);
 	}
 	xcb_copy_area(wm.conn, pix, c->frame, gc, 0, 0,

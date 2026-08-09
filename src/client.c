@@ -504,7 +504,12 @@ struct client *client_manage(xcb_window_t win, bool adopting)
 	 * backing store は持たない（サーバ側メモリを食うだけで、Expose で描き直す）。 */
 	depth = wm.depth != 0 ? wm.depth : (uint8_t)XCB_COPY_FROM_PARENT;
 	c->frame = xcb_generate_id(wm.conn);
-	vals[0] = wm.screen != NULL ? wm.screen->white_pixel : 0u;  /* Phase 2 で theme.c の face 色に置き換える */
+	/*
+	 * フレームの背景はテーマの face 色 (§4.1)。
+	 * サーバはリサイズや Expose の際にこの色で塗ってから我々に
+	 * Expose を投げるので、白のままだとリサイズのたびに白くちらつく。
+	 */
+	vals[0] = wm.cfg.color[THEME_FACE];
 	vals[1] = XCB_BACKING_STORE_NOT_USEFUL;
 	vals[2] = FRAME_EVENT_MASK;
 	xcb_create_window(wm.conn, depth, c->frame, wm.root,
