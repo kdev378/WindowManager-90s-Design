@@ -22,6 +22,9 @@ core ビルドでの日本語タイトル表示は、環境にある X コアフ
 | --- | --- |
 | [docs/SPEC.md](docs/SPEC.md) | 仕様書（設計方針、外観・挙動の詳細、対応プロトコル、メモリ目標） |
 | [docs/PLAN.md](docs/PLAN.md) | 開発計画（7 フェーズの工程、検証戦略、リスク） |
+| [docs/TRACEABILITY.md](docs/TRACEABILITY.md) | 要求 → 実装 → 検証の対応表。**埋まっていない穴も明記** |
+| [docs/MANUAL-TEST.md](docs/MANUAL-TEST.md) | 実環境での手動検証の手引き（GUI 環境の作り方から） |
+| [docs/MEMORY.md](docs/MEMORY.md) | メモリ実測の記録と、計測方法を 2 度直した経緯 |
 
 ## 状態
 
@@ -45,8 +48,9 @@ make memcheck # メモリ実測 (SPEC §9.1)
 `Super` 単押しでの起動（タップ判定）。OpenBSD への移植は Phase 5。
 各項目の状態は [docs/PLAN.md](docs/PLAN.md) の「Phase 4 の結果」を参照。
 
-実環境での手動検証の手順は [docs/MANUAL-TEST.md](docs/MANUAL-TEST.md)
-（CLI しか無いマシンに GUI を立てるところから書いてあります）。
+何がどこまで検証されているかは [docs/TRACEABILITY.md](docs/TRACEABILITY.md)
+に一覧があります（**未検証の 12 項目も優先度付きで明記**）。
+実環境での手動検証は [docs/MANUAL-TEST.md](docs/MANUAL-TEST.md)。
 
 | 指標 | 実測 | 目標 | 判定 |
 | --- | --- | --- | --- |
