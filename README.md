@@ -29,7 +29,7 @@ core ビルドでの日本語タイトル表示は、環境にある X コアフ
 
 ```
 make          # ビルド (依存: libxcb, xcb-randr, xcb-sync, xcb-keysyms, xcb-shape)
-make test     # Xvfb 上で結合テスト (11 本)
+make test     # Xvfb 上で結合テスト (13 本)
 make memcheck # メモリ実測 (SPEC §9.1)
 ```
 
@@ -44,6 +44,9 @@ make memcheck # メモリ実測 (SPEC §9.1)
 最小化のズームアニメーション、デスクトップの右クリックメニュー、
 `Super` 単押しでの起動（タップ判定）。OpenBSD への移植は Phase 5。
 各項目の状態は [docs/PLAN.md](docs/PLAN.md) の「Phase 4 の結果」を参照。
+
+実環境での手動検証の手順は [docs/MANUAL-TEST.md](docs/MANUAL-TEST.md)
+（CLI しか無いマシンに GUI を立てるところから書いてあります）。
 
 | 指標 | 実測 | 目標 | 判定 |
 | --- | --- | --- | --- |

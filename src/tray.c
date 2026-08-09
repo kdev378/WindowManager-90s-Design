@@ -61,6 +61,12 @@ static void remove_icon(int idx)
 {
 	if (idx < 0 || (uint16_t)idx >= tr.n)
 		return;
+	/*
+	 * save-set から外す (§3.1.1)。既に破棄された窓に対しては
+	 * BadWindow になるが、unchecked なので無視されるだけでよい (§2.2.2)。
+	 * 外し忘れると、save-set にゴミが溜まったまま WM が生き続ける。
+	 */
+	xcb_change_save_set(wm.conn, XCB_SET_MODE_DELETE, tr.icon[idx]);
 	memmove(&tr.icon[idx], &tr.icon[idx + 1],
 	        (size_t)(tr.n - idx - 1) * sizeof tr.icon[0]);
 	memmove(&tr.mapped[idx], &tr.mapped[idx + 1],
@@ -128,6 +134,22 @@ static void dock_icon(xcb_window_t w)
 	/* アイコンは消えやすい。以降のリクエストは全てエラー許容 (§2.2.2) */
 	vals[0] = XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_PROPERTY_CHANGE;
 	xcb_change_window_attributes(wm.conn, w, XCB_CW_EVENT_MASK, vals);
+
+	/*
+	 * ★ save-set への登録 (§3.1.1)。**フレームと同じ理由でトレイにも要る。**
+	 *
+	 * DestroyWindow は所有者に関係なく**サブウィンドウを全て道連れにする**。
+	 * トレイのコンテナは WM の資源なので、WM が死ねば（クリーンな終了でも
+	 * クラッシュでも）サーバはこれを破棄し、その子である他プロセスの
+	 * トレイアイコンまで一緒に消す。常駐アプリ側から見ると
+	 * 「WM を再起動したらアイコンが二度と戻らない」という壊れ方をする。
+	 *
+	 * save-set に入れておけば、サーバは破棄の前にアイコンをルートへ
+	 * 戻してくれる。これはコンテナを reparent 親として使う以上、
+	 * **必須**であって最適化ではない。
+	 */
+	xcb_change_save_set(wm.conn, XCB_SET_MODE_INSERT, w);
+
 	xcb_reparent_window(wm.conn, w, tr.owner, 0, 0);
 	{
 		uint32_t g[2];
@@ -234,13 +256,22 @@ void tray_fini(void)
 {
 	if (!tr.active)
 		return;
-	/* アイコンはクライアントの資源。破棄せずルートへ戻す */
+	/* アイコンはクライアントの資源。破棄せずルートへ戻し、save-set から外す */
 	while (tr.n > 0) {
-		xcb_reparent_window(wm.conn, tr.icon[tr.n - 1], wm.root, 0, 0);
+		xcb_window_t w = tr.icon[tr.n - 1];
+
+		xcb_reparent_window(wm.conn, w, wm.root, 0, 0);
+		xcb_change_save_set(wm.conn, XCB_SET_MODE_DELETE, w);
 		tr.n--;
 	}
 	xcb_destroy_window(wm.conn, tr.owner);
 	tr.active = false;
+	/*
+	 * ここで必ず掃き出す。この後は wm_shutdown() → xcb_disconnect() で、
+	 * 送信待ちのまま切断すると上の reparent が届かず、
+	 * コンテナの破棄だけがサーバ側で起きてアイコンを道連れにする。
+	 */
+	xcb_flush(wm.conn);
 }
 
 /* ------------------------------------------------------------------ *
@@ -264,6 +295,16 @@ void tray_place(int16_t x, int16_t y, uint16_t h)
 	tr.x = x; tr.y = y; tr.h = h;
 
 	if (w == 0) {
+		/*
+		 * アイコンが 1 つも無くなったら unmap する。
+		 * **併せて 1px まで縮める。** unmap しただけだと直前の幅を
+		 * 抱えたまま残り、「トレイの幅」を外から見たときに
+		 * 実際の中身と食い違う（見た目には出ないが、状態としては嘘）。
+		 */
+		vals[0] = 1;
+		vals[1] = h ? h : 1;
+		xcb_configure_window(wm.conn, tr.owner,
+			XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, vals);
 		xcb_unmap_window(wm.conn, tr.owner);
 		return;
 	}
