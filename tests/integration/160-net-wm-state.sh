@@ -39,7 +39,7 @@ pkg-config --exists xcb 2>/dev/null || skip "xcb がありません"
 require_tool xterm
 
 TMP=$(mktemp -d)
-cleanup_tmp() { rm -rf "$TMP"; }
+cleanup_tmp() { rm -rf "$TMP" 2>/dev/null || true; }
 trap 'cleanup_tmp' EXIT
 
 cat >"$TMP/setstate.c" <<'EOF'
@@ -140,7 +140,32 @@ states() {
 }
 has_state() { states | grep -q "$1"; }
 no_state()  { ! states | grep -q "$1"; }
-setst() { "$TMP/setstate" "$win" "$@" >/dev/null 2>&1 || true; sleep 0.6; }
+setst() { "$TMP/setstate" "$win" "$@" >/dev/null 2>&1 || true; sleep 0.4; }
+
+#
+# ★ 固定の sleep で状態を見てはいけない。
+#   ClientMessage は非同期で、負荷が高いと WM の処理が遅れる。
+#   18 本を続けて回すと「たまに落ちるテスト」になる（実際になった）。
+#   期待する状態に落ち着くまで待つ。
+#
+# 上限は時間で決める。負荷が高いと xprop の起動自体が遅くなり、
+# 回数で数えると実時間がまるで足りなくなる。
+wait_has() {   # wait_has <部分文字列>
+	__deadline=$(( $(date +%s) + 15 ))
+	while [ "$(date +%s)" -lt "$__deadline" ]; do
+		has_state "$1" && return 0
+		sleep 0.2
+	done
+	return 1
+}
+wait_no() {    # wait_no <部分文字列>
+	__deadline=$(( $(date +%s) + 15 ))
+	while [ "$(date +%s)" -lt "$__deadline" ]; do
+		no_state "$1" && return 0
+		sleep 0.2
+	done
+	return 1
+}
 frame_geom() {
 	f=$(get_parent_window "$win")
 	[ -n "$f" ] || f=$(to_hex "$win")
@@ -153,35 +178,35 @@ frame_geom() {
 # 1. ADD / REMOVE / TOGGLE
 # ------------------------------------------------------------------
 setst add _NET_WM_STATE_ABOVE
-has_state _NET_WM_STATE_ABOVE || fail "(1) ADD で ABOVE が付きません: $(states)"
+wait_has _NET_WM_STATE_ABOVE || fail "(1) ADD で ABOVE が付きません: $(states)"
 
 setst remove _NET_WM_STATE_ABOVE
-no_state _NET_WM_STATE_ABOVE || fail "(1) REMOVE で ABOVE が消えません: $(states)"
+wait_no _NET_WM_STATE_ABOVE || fail "(1) REMOVE で ABOVE が消えません: $(states)"
 
 setst toggle _NET_WM_STATE_ABOVE
-has_state _NET_WM_STATE_ABOVE || fail "(1) TOGGLE で ABOVE が付きません: $(states)"
+wait_has _NET_WM_STATE_ABOVE || fail "(1) TOGGLE で ABOVE が付きません: $(states)"
 setst toggle _NET_WM_STATE_ABOVE
-no_state _NET_WM_STATE_ABOVE || fail "(1) TOGGLE の 2 回目で ABOVE が消えません: $(states)"
+wait_no _NET_WM_STATE_ABOVE || fail "(1) TOGGLE の 2 回目で ABOVE が消えません: $(states)"
 
 # ------------------------------------------------------------------
 # 2. 1 メッセージで 2 状態
 # ------------------------------------------------------------------
 setst add _NET_WM_STATE_ABOVE _NET_WM_STATE_STICKY
-has_state _NET_WM_STATE_ABOVE  || fail "(2) 同時指定で ABOVE が付きません: $(states)"
-has_state _NET_WM_STATE_STICKY || fail "(2) 同時指定で STICKY が付きません: $(states)"
+wait_has _NET_WM_STATE_ABOVE || fail "(2) 同時指定で ABOVE が付きません: $(states)"
+wait_has _NET_WM_STATE_STICKY || fail "(2) 同時指定で STICKY が付きません: $(states)"
 
 setst remove _NET_WM_STATE_ABOVE _NET_WM_STATE_STICKY
-no_state _NET_WM_STATE_ABOVE  || fail "(2) 同時解除で ABOVE が残ります: $(states)"
-no_state _NET_WM_STATE_STICKY || fail "(2) 同時解除で STICKY が残ります: $(states)"
+wait_no _NET_WM_STATE_ABOVE || fail "(2) 同時解除で ABOVE が残ります: $(states)"
+wait_no _NET_WM_STATE_STICKY || fail "(2) 同時解除で STICKY が残ります: $(states)"
 
 # ------------------------------------------------------------------
 # 3. 未知アトムを混ぜても既知の方は処理される
 # ------------------------------------------------------------------
 setst add _NET_WM_STATE_ABOVE _W98WM_TEST_BOGUS_STATE
 wm_alive || fail "(3) 未知アトムを混ぜたら WM が死にました"
-has_state _NET_WM_STATE_ABOVE ||
+wait_has _NET_WM_STATE_ABOVE ||
 	fail "(3) 未知アトムを混ぜると既知の状態も処理されません: $(states)"
-no_state _W98WM_TEST_BOGUS_STATE ||
+wait_no _W98WM_TEST_BOGUS_STATE ||
 	fail "(3) 未知アトムがそのまま _NET_WM_STATE に載っています: $(states)"
 setst remove _NET_WM_STATE_ABOVE
 
@@ -191,27 +216,27 @@ setst remove _NET_WM_STATE_ABOVE
 before=$(frame_geom)
 
 setst add _NET_WM_STATE_MAXIMIZED_VERT
-has_state MAXIMIZED_VERT || fail "(4) 縦のみ最大化ができません: $(states)"
-no_state MAXIMIZED_HORZ  || fail "(4) 縦だけ要求したのに横も最大化されました: $(states)"
+wait_has MAXIMIZED_VERT || fail "(4) 縦のみ最大化ができません: $(states)"
+wait_no MAXIMIZED_HORZ || fail "(4) 縦だけ要求したのに横も最大化されました: $(states)"
 v_only=$(frame_geom)
 
 setst add _NET_WM_STATE_MAXIMIZED_HORZ
-has_state MAXIMIZED_VERT || fail "(4) 横を足したら縦が外れました: $(states)"
-has_state MAXIMIZED_HORZ || fail "(4) 横を足せません: $(states)"
+wait_has MAXIMIZED_VERT || fail "(4) 横を足したら縦が外れました: $(states)"
+wait_has MAXIMIZED_HORZ || fail "(4) 横を足せません: $(states)"
 both=$(frame_geom)
 [ "$both" != "$v_only" ] || fail "(4) 横を足してもジオメトリが変わりません ($both)"
 
 # 片軸だけ解除 → もう片軸は保たれること
 setst remove _NET_WM_STATE_MAXIMIZED_HORZ
-has_state MAXIMIZED_VERT ||
+wait_has MAXIMIZED_VERT ||
 	fail "(4) **横だけ解除したのに縦まで外れました**: $(states)"
-no_state MAXIMIZED_HORZ || fail "(4) 横が解除されません: $(states)"
+wait_no MAXIMIZED_HORZ || fail "(4) 横が解除されません: $(states)"
 back_to_v=$(frame_geom)
 [ "$back_to_v" = "$v_only" ] ||
 	fail "(4) 横を解除しても縦のみの状態に戻りません ($v_only -> $back_to_v)"
 
 setst remove _NET_WM_STATE_MAXIMIZED_VERT
-no_state MAXIMIZED_VERT || fail "(4) 縦が解除されません: $(states)"
+wait_no MAXIMIZED_VERT || fail "(4) 縦が解除されません: $(states)"
 restored=$(frame_geom)
 [ "$restored" = "$before" ] ||
 	fail "(4) 全解除で元のジオメトリに戻りません ($before -> $restored)"
@@ -221,7 +246,7 @@ setst add _NET_WM_STATE_MAXIMIZED_HORZ
 h_only=$(frame_geom)
 setst add _NET_WM_STATE_MAXIMIZED_VERT
 setst remove _NET_WM_STATE_MAXIMIZED_VERT
-has_state MAXIMIZED_HORZ ||
+wait_has MAXIMIZED_HORZ ||
 	fail "(4) **縦だけ解除したのに横まで外れました**: $(states)"
 [ "$(frame_geom)" = "$h_only" ] ||
 	fail "(4) 縦を解除しても横のみの状態に戻りません"
@@ -249,10 +274,15 @@ while [ $k -lt 30 ]; do
 	"$TMP/setstate" "$win" toggle _NET_WM_STATE_ABOVE >/dev/null 2>&1 || true
 	k=$((k + 1))
 done
-sleep 1.5
+#
+# 連打の直後は WM がまだ処理中のことがある。固定 sleep で見ると
+# 負荷が高いときだけ落ちる「たまに落ちるテスト」になるので、
+# 期待する状態に落ち着くまで待つ。
+#
+wait_no _NET_WM_STATE_ABOVE || true
 wm_alive || fail "(6) 高速連打で WM が死にました"
 # 30 回 = 偶数回なので元に戻っているはず
-no_state _NET_WM_STATE_ABOVE ||
+wait_no _NET_WM_STATE_ABOVE ||
 	fail "(6) TOGGLE を偶数回送ったのに ABOVE が残っています: $(states)"
 
 k=0
@@ -284,12 +314,12 @@ if [ -n "$panel" ] && command -v convert >/dev/null 2>&1; then
 		[ "$sig_before" != "$sig_after" ] ||
 			fail "(7) SKIP_TASKBAR を付けてもタスクバーの見た目が変わりません"
 	fi
-	has_state SKIP_TASKBAR || fail "(7) SKIP_TASKBAR が状態に載りません: $(states)"
+	wait_has SKIP_TASKBAR || fail "(7) SKIP_TASKBAR が状態に載りません: $(states)"
 	setst remove _NET_WM_STATE_SKIP_TASKBAR
 else
 	echo "# タスクバーか ImageMagick が無いので SKIP_TASKBAR の見た目確認は省略"
 	setst add _NET_WM_STATE_SKIP_TASKBAR
-	has_state SKIP_TASKBAR || fail "(7) SKIP_TASKBAR が状態に載りません: $(states)"
+	wait_has SKIP_TASKBAR || fail "(7) SKIP_TASKBAR が状態に載りません: $(states)"
 	setst remove _NET_WM_STATE_SKIP_TASKBAR
 fi
 
@@ -304,9 +334,9 @@ for st in _NET_WM_STATE_MODAL _NET_WM_STATE_SKIP_PAGER \
           _NET_WM_STATE_BELOW _NET_WM_STATE_DEMANDS_ATTENTION; do
 	short=$(printf '%s' "$st" | sed 's/_NET_WM_STATE_//')
 	setst add "$st"
-	has_state "$short" || fail "(8) $st を ADD しても状態に載りません: $(states)"
+	wait_has "$short" || fail "(8) $st を ADD しても状態に載りません: $(states)"
 	setst remove "$st"
-	no_state "$short" || fail "(8) $st を REMOVE しても残ります: $(states)"
+	wait_no "$short" || fail "(8) $st を REMOVE しても残ります: $(states)"
 done
 
 # ------------------------------------------------------------------
@@ -314,7 +344,7 @@ done
 # ------------------------------------------------------------------
 geom_before_fs=$(frame_geom)
 setst add _NET_WM_STATE_FULLSCREEN
-has_state FULLSCREEN || fail "(9) 全画面になりません: $(states)"
+wait_has FULLSCREEN || fail "(9) 全画面になりません: $(states)"
 fs_geom=$(frame_geom)
 [ "$fs_geom" != "$geom_before_fs" ] || fail "(9) 全画面でジオメトリが変わりません"
 
@@ -329,7 +359,15 @@ if [ -n "$scr_w" ] && [ -n "$scr_h" ]; then
 fi
 
 setst remove _NET_WM_STATE_FULLSCREEN
-no_state FULLSCREEN || fail "(9) 全画面を解除できません: $(states)"
+if ! wait_no FULLSCREEN; then
+	# 稀に（十数回に 1 回）ここで落ちる。原因未特定なので、
+	# 再現したときに追えるだけの情報を残す。
+	echo "# --- 診断: _NET_WM_STATE ---"
+	xprop -display "$DISPLAY" -id "$win" _NET_WM_STATE 2>&1 | sed 's/^/#   /'
+	echo "# --- 診断: WM のログ末尾 ---"
+	tail -10 "$WM_PID_LOG" 2>/dev/null | sed 's/^/#   /'
+	fail "(9) 全画面を解除できません: $(states)"
+fi
 [ "$(frame_geom)" = "$geom_before_fs" ] ||
 	fail "(9) 全画面の解除で元のジオメトリに戻りません"
 

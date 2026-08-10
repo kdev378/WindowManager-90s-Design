@@ -135,18 +135,30 @@ count_children() {
 	xwininfo -display "$DISPLAY" -root -children 2>/dev/null |
 		awk '/children:/ { print $1; exit }'
 }
+# 固定 sleep だと負荷時に取りこぼす。増減が観測できるまで待つ。
+wait_children() {   # wait_children <比較演算子 gt|eq> <基準>
+	__op="$1"; __ref="$2"; __i=0
+	while [ $__i -lt 40 ]; do
+		__n=$(count_children)
+		case "$__op" in
+		gt) [ "${__n:-0}" -gt "$__ref" ] && return 0 ;;
+		eq) [ "${__n:-0}" -eq "$__ref" ] && return 0 ;;
+		esac
+		sleep 0.15
+		__i=$((__i + 1))
+	done
+	return 1
+}
+
 before=$(count_children)
 xdotool key --clearmodifiers ctrl+Escape
-sleep 0.8
+wait_children gt "$before" ||
+	fail "Ctrl+Esc でスタートメニューが開きませんでした ($before -> $(count_children))"
 during=$(count_children)
-[ "$during" -gt "$before" ] ||
-	fail "Ctrl+Esc でスタートメニューが開きませんでした ($before -> $during)"
 
 xdotool key --clearmodifiers Escape
-sleep 0.8
-after=$(count_children)
-[ "$after" = "$before" ] ||
-	fail "Esc でスタートメニューが閉じませんでした ($before -> $during -> $after)"
+wait_children eq "$before" ||
+	fail "Esc でスタートメニューが閉じませんでした ($before -> $during -> $(count_children))"
 
 # ------------------------------------------------------------------
 # 6. Alt+Tab

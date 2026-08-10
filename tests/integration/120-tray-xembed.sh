@@ -34,7 +34,7 @@ pkg-config --exists xcb 2>/dev/null || skip "xcb がありません"
 require_tool xwininfo
 
 TMP=$(mktemp -d)
-cleanup_tmp() { rm -rf "$TMP"; }
+cleanup_tmp() { rm -rf "$TMP" 2>/dev/null || true; }
 trap 'cleanup_tmp' EXIT
 
 cat >"$TMP/trayclient.c" <<'EOF'

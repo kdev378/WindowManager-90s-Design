@@ -98,8 +98,32 @@ start_xvfb() {
 		i=$((i + 1))
 	done
 	[ -e "/tmp/.X${disp}-lock" ] || fail "Xvfb の起動に失敗しました"
+
 	DISPLAY=":$disp"
 	export DISPLAY
+
+	#
+	# ★ ロックファイルができた ≠ 接続を受け付けられる。
+	#
+	#   ロックは Xvfb が起動の**最初**に作る。実際にソケットで待ち受ける
+	#   までには少し間があり、その隙間に start_wm() が走ると WM が
+	#   接続に失敗して即座に終了する。テストからは
+	#   「WM が起動直後に終了しました」に見える。
+	#   負荷が低いときは間に合ってしまうので、**テストの本数が増えて
+	#   初めて顕在化する**たちの悪い競合になる。実際に 18 本にしたところで
+	#   毎回 2〜5 本が落ちるようになった。
+	#
+	#   実際にプロパティを 1 つ引けるまで待つ。
+	#
+	i=0
+	while [ $i -lt 100 ]; do
+		if xprop -display "$DISPLAY" -root >/dev/null 2>&1; then
+			return 0
+		fi
+		sleep 0.1
+		i=$((i + 1))
+	done
+	fail "Xvfb が接続を受け付けません ($DISPLAY)"
 }
 
 # start_wm: $WM_BIN を起動し WM_PID を設定する。

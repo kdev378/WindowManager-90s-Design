@@ -53,7 +53,7 @@ FULL_TOP=$((BORDER + CAPTION))
 SMALL_TOP=$((BORDER + CAPTION_SMALL))
 
 TMP=$(mktemp -d)
-cleanup_tmp() { rm -rf "$TMP"; }
+cleanup_tmp() { rm -rf "$TMP" 2>/dev/null || true; }
 trap 'cleanup_tmp' EXIT
 
 cat >"$TMP/typed.c" <<'EOF'
@@ -178,7 +178,8 @@ order_file="$TMP/order.txt"
 : >"$order_file"
 fails=0
 
-echo "$TYPES" | while IFS=: read -r ty deco layer focus; do
+printf '%s\n' "$TYPES" >"$TMP/types.txt"
+while IFS=: read -r ty deco layer focus; do
 	[ -n "$ty" ] || continue
 
 	# 直前のアクティブウィンドウを控えてから開く
@@ -200,7 +201,17 @@ echo "$TYPES" | while IFS=: read -r ty deco layer focus; do
 		echo "FAILTYPE $ty 窓を作れませんでした" >>"$TMP/fails.txt"
 		continue
 	fi
-	sleep 1.2
+
+	# 固定の sleep にしない。18 本を続けて回すと負荷で足りなくなり、
+	# 「たまに落ちるテスト」になる。管理下に入るまでポーリングする。
+	j=0
+	while [ $j -lt 40 ]; do
+		xprop -display "$DISPLAY" -root _NET_CLIENT_LIST 2>/dev/null |
+			grep -qi "$(printf '%x' "$win")" && break
+		sleep 0.15
+		j=$((j + 1))
+	done
+	sleep 0.4
 
 	printf '%s %s %s %s %s\n' "$ty" "$win" "$deco" "$layer" "$focus" >>"$order_file"
 
@@ -239,7 +250,7 @@ echo "$TYPES" | while IFS=: read -r ty deco layer focus; do
 		esac
 		;;
 	esac
-done
+done <"$TMP/types.txt"
 
 wm_alive || fail "13 種を開く途中で WM が死にました (ログ: $WM_PID_LOG)"
 

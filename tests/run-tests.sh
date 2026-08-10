@@ -28,7 +28,7 @@ export W98WM_BIN="$ROOT_DIR/w98wm"
 
 TIMEOUT_BIN=""
 if command -v timeout >/dev/null 2>&1; then
-	TIMEOUT_BIN="timeout 90"
+	TIMEOUT_BIN="timeout 240"
 fi
 
 n=0
@@ -49,18 +49,34 @@ skip=0
 # 同時に走っているかもしれない memcheck --long の被験ウィンドウを
 # 巻き添えにする（Xvfb を落とせばぶら下がる xterm も接続断で終わる）。
 #
-_snapshot_servers() {
-	{ pgrep -x Xvfb; pgrep -x w98wm; } 2>/dev/null | sort -u
-}
+#
+# ★ 「前後のスナップショットの差」で回収してはいけない。
+#
+#   最初はそう書いたが、**このランナを 2 つ同時に走らせると
+#   互いの Xvfb と w98wm を「リークした」と誤認して殺し合う**。
+#   実際に踏んだ（6 本が「WM が起動直後に終了しました」で落ちた）。
+#
+#   代わりに、このランナが起動したプロセスに環境変数で印を付け、
+#   **自分の印を持つものだけ**を回収する。差分を取る必要も無くなる
+#   （テストが終わった時点で自分の印を持つサーバは全部リークなので）。
+#
+#   /proc が読めない環境では回収を諦める（lib.sh の trap に任せる）。
+#
+W98WM_TEST_RUN="run-$$-$(date +%s)"
+export W98WM_TEST_RUN
 
 _reap_leaked_servers() {
-	before_f="$1"
-	after_f=$(mktemp)
-	_snapshot_servers >"$after_f"
+	[ -d /proc ] || return 0
 
-	# before に無くて after にある = このテストが取り残した
-	leaked=$(grep -vxF -f "$before_f" "$after_f" 2>/dev/null || true)
-	rm -f "$after_f"
+	leaked=""
+	for p in $( { pgrep -x Xvfb; pgrep -x w98wm; } 2>/dev/null | sort -u); do
+		[ -r "/proc/$p/environ" ] || continue
+		# 読む間に消えることがある。エラーは無視してよい
+		if tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null |
+				grep -qxF "W98WM_TEST_RUN=$W98WM_TEST_RUN" 2>/dev/null; then
+			leaked="$leaked $p"
+		fi
+	done
 	[ -z "$leaked" ] && return 0
 
 	for p in $leaked; do
@@ -77,8 +93,6 @@ run_one() {
 	name=$(basename "$path")
 	n=$((n + 1))
 	logf=$(mktemp)
-	before_f=$(mktemp)
-	_snapshot_servers >"$before_f"
 
 	if [ -n "$TIMEOUT_BIN" ]; then
 		$TIMEOUT_BIN "$path" >"$logf" 2>&1 && rc=0 || rc=$?
@@ -86,8 +100,7 @@ run_one() {
 		"$path" >"$logf" 2>&1 && rc=0 || rc=$?
 	fi
 
-	_reap_leaked_servers "$before_f"
-	rm -f "$before_f"
+	_reap_leaked_servers
 
 	if [ "$rc" -eq 0 ]; then
 		echo "ok $n - $name"

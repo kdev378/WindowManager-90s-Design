@@ -42,7 +42,7 @@ command -v cc >/dev/null 2>&1 || skip "cc がありません"
 pkg-config --exists xcb 2>/dev/null || skip "xcb がありません"
 
 TMP=$(mktemp -d)
-cleanup_tmp() { rm -rf "$TMP"; }
+cleanup_tmp() { rm -rf "$TMP" 2>/dev/null || true; }
 trap 'cleanup_tmp' EXIT
 
 cat >"$TMP/unmapclient.c" <<'EOF'

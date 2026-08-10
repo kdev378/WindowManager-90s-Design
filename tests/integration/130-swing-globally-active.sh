@@ -38,7 +38,7 @@ SRC="$ROOT_DIR/tools/SwingTest.java"
 [ -f "$SRC" ] || skip "tools/SwingTest.java がありません"
 
 TMP=$(mktemp -d)
-cleanup_tmp() { rm -rf "$TMP"; }
+cleanup_tmp() { rm -rf "$TMP" 2>/dev/null || true; }
 trap 'cleanup_tmp' EXIT
 
 javac -d "$TMP/classes" "$SRC" >"$TMP/javac.log" 2>&1 ||

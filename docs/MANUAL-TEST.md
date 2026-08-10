@@ -27,7 +27,7 @@ Xvfb 上の自動テストで確認済みなのは
 
 ```sh
 make            # まずこれが通るか
-make test       # 17 本すべて ok か
+make test       # 18 本すべて ok か
 make memcheck   # M0/M1/M20 が PASS か（arm64 の実測値が知りたい）
 ```
 

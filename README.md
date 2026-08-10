@@ -32,7 +32,7 @@ core ビルドでの日本語タイトル表示は、環境にある X コアフ
 
 ```
 make          # ビルド (依存: libxcb, xcb-randr, xcb-sync, xcb-keysyms, xcb-shape)
-make test     # Xvfb 上で結合テスト (17 本)
+make test     # Xvfb 上で結合テスト (18 本)
 make memcheck # メモリ実測 (SPEC §9.1)
 ```
 
