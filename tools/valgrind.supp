@@ -1,0 +1,32 @@
+# valgrind の抑制ファイル (w98wm)
+#
+#   valgrind --suppressions=tools/valgrind.supp ./w98wm
+#
+# ここに載せるのは「w98wm の外が原因で、無害と確認したもの」だけ。
+# 載せるときは原因と確認方法を必ず書くこと。
+
+# ------------------------------------------------------------------
+# libxcb-randr: RRGetMonitors の末尾パディング 3 バイトが未初期化
+#
+#   Syscall param writev(vector[0]) points to uninitialised byte(s)
+#     ... xcb_wait_for_reply ← layout_update_monitors
+#
+# --track-origins=yes で辿ると、未初期化の出どころは
+# xcb_randr_get_monitors() 自身のスタック上の要求構造体である
+# （valgrind は PIE を 0x108000 に置くので、報告されたアドレスから
+#   それを引いて addr2line / objdump で引くと PLT の
+#   xcb_randr_get_monitors に当たる）。
+# GetMonitors の要求は window(4) + get_active(1) + pad(3) だが、
+# xcb-proto の定義に末尾の pad が明記されておらず、生成コードが
+# その 3 バイトを書かない。サーバは pad を読まないので実害は無い。
+# 外部テスト (2026-10-27) の所見 6。
+# ------------------------------------------------------------------
+{
+   libxcb-randr-GetMonitors-trailing-pad
+   Memcheck:Param
+   writev(vector[0])
+   fun:writev
+   obj:*libxcb.so*
+   ...
+   fun:layout_update_monitors
+}

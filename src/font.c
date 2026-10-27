@@ -48,6 +48,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include <xcb/xcb.h>
 #include <xcb/xproto.h>
@@ -352,6 +353,7 @@ struct core_font {
 static struct core_font g_pri;         /* プライマリ (§4.5.1) */
 static struct core_font g_aux;         /* CJK 補助 (§4.5.4)。1 つだけ */
 static bool     g_have_aux;
+static bool     g_aux_jis;             /* 補助が jisx0208.1983-0（区点で引く） */
 
 static bool     g_builtin;             /* 候補 1-8 が全滅して内蔵に落ちた */
 static bool     g_ready;               /* 何かしら描ける状態か */
@@ -411,15 +413,51 @@ static bool cf_covers(const struct core_font *f, uint16_t c)
 	       b2 >= f->min_char  && b2 <= f->max_char;
 }
 
-/* この文字をどのフォントで描くか (§4.5.4 の擬似コードそのもの) */
+/*
+ * CJK の字か。この範囲だけは補助フォントを**先に**当てる。
+ *
+ * 範囲判定だけでプライマリを優先すると、iso10646-1 の欧文フォント
+ * （xfonts-base の 6x13 など）が「範囲としては U+4E00 を含むがグリフは
+ * 持っていない」ために全部豆腐になる（外部テストで発見）。グリフの有無を
+ * 確かめるには QueryFont が要るので使えない（禁止事項 (2)）。
+ * CJK は補助に任せる、と決め打ちする方が確実。
+ */
+static bool is_cjk(uint16_t c)
+{
+	return (c >= 0x3000u && c <= 0x30FFu) ||   /* 約物・ひらがな・カタカナ */
+	       (c >= 0x3400u && c <= 0x4DBFu) ||   /* 拡張 A */
+	       (c >= 0x4E00u && c <= 0x9FFFu) ||   /* 統合漢字 */
+	       (c >= 0xF900u && c <= 0xFAFFu) ||   /* 互換漢字 */
+	       (c >= 0xFF00u && c <= 0xFFEFu);     /* 全角英数・半角カナ */
+}
+
+/* 補助フォントに渡すコード。jisx0208 なら区点に引き直す。0 は「無い」 */
+static uint16_t aux_code(uint16_t c)
+{
+	if (g_aux_jis)
+		return ucs_to_jis0208(c);
+	return cf_covers(&g_aux, c) ? c : 0;
+}
+
+/* この文字をどのフォントで描くか (§4.5.4) */
 static xcb_font_t font_for(uint16_t c)
 {
+	if (g_have_aux && is_cjk(c) && aux_code(c) != 0)
+		return g_aux.id;
 	if (cf_covers(&g_pri, c))
 		return g_pri.id;
-	if (g_have_aux && cf_covers(&g_aux, c))
+	if (g_have_aux && aux_code(c) != 0)
 		return g_aux.id;
 	/* どちらの範囲にも無い → プライマリに投げて default_char を描かせる */
 	return g_pri.id;
+}
+
+/* フォント f で描くときの CHAR2B。補助が jisx0208 なら区点にする */
+static uint16_t code_for(xcb_font_t f, uint16_t c)
+{
+	if (g_have_aux && f == g_aux.id && g_aux_jis)
+		return ucs_to_jis0208(c);
+	return c;
 }
 
 static size_t font_to_ucs2(const char *utf8, size_t len, uint16_t *out)
@@ -466,12 +504,30 @@ static const struct font_cand {
 	/* 8  */ { "fixed",                                                    0 }
 };
 
-/* CJK 補助フォントの候補 (§4.5.4)。開くのは 1 つだけ */
+/*
+ * CJK 補助フォントの候補 (§4.5.4)。開くのは 1 つだけ。
+ * キャプションに収まる小さいものから順に当たる。
+ *   12x13ja (xfonts-base)           … iso10646-1 で JIS 第 1・第 2 水準を持つ
+ *   k14 / jiskan16 (xfonts-intl-japanese 等) … jisx0208.1983-0。区点で引く
+ *   18x18ja (xfonts-base)           … 大きいが無いよりよい
+ */
 static const struct font_cand g_aux_cands[] = {
-	{ "-*-*-medium-r-normal--%u-*-*-*-c-*-jisx0208.1983-0", 14 },
-	{ "-misc-fixed-medium-r-normal-ja-*",                    0 },
-	{ "-*-*-*-*-*-*-%u-*-*-*-*-*-iso10646-1",               14 }
+	{ "-misc-fixed-medium-r-normal-ja-%u-*-*-*-*-*-iso10646-1", 13 },
+	{ "-*-*-medium-r-normal--%u-*-*-*-c-*-jisx0208.1983-0",     14 },
+	{ "-*-*-medium-r-normal--%u-*-*-*-c-*-jisx0208.1983-0",     16 },
+	{ "-misc-fixed-medium-r-normal-ja-*-iso10646-1",             0 },
+	{ "-*-*-*-*-*-*-*-*-*-*-*-*-jisx0208.1983-0",                0 }
 };
+
+static bool name_is_jis0208(const char *name)
+{
+	size_t n = strlen(name);
+	static const char suf[] = "jisx0208.1983-0";
+	size_t s = sizeof(suf) - 1;
+
+	/* XLFD の charset/encoding は大文字小文字を区別しない */
+	return n >= s && strncasecmp(name + n - s, suf, s) == 0;
+}
 
 /*
  * ListFontsWithInfo で 1 件目を引く。
@@ -571,6 +627,7 @@ static bool font_try_pattern(const char *pattern, struct core_font *f)
 {
 	if (!font_probe(pattern, f))
 		return false;
+	LOG("font: 候補 %s → %s", pattern, f->name);
 	if (!font_open(f)) {
 		LOG("font: ListFontsWithInfo は当たったが OpenFont に失敗: %s",
 		    f->name);
@@ -636,24 +693,36 @@ static void font_init_aux(void)
 	size_t i;
 	char buf[256];
 
-	/* プライマリが CJK を範囲で覆っているなら補助は不要 */
-	if (cf_covers(&g_pri, 0x4E00u) && cf_covers(&g_pri, 0x3042u))
-		return;
-
+	/*
+	 * 「プライマリが範囲で CJK を覆っていれば補助は不要」とは**しない**。
+	 * 欧文の iso10646-1 フォントは範囲だけ広くてグリフが無いことが多い
+	 * （is_cjk() の注記を参照）。フォントを 1 つ余分に開いても、グリフは
+	 * サーバ側にあるので WM の常駐量は増えない。
+	 */
 	for (i = 0; i < sizeof(g_aux_cands) / sizeof(g_aux_cands[0]); i++) {
 		struct core_font f;
+		bool jis;
 
 		font_expand(&g_aux_cands[i], buf, sizeof(buf), g_scale);
 		if (!font_try_pattern(buf, &f))
 			continue;
-		/* CJK を覆っていない補助フォントには意味が無い */
-		if (!cf_covers(&f, 0x4E00u)) {
+		/* 既にプライマリとして開いているものを二重に使わない */
+		if (strcmp(f.name, g_pri.name) == 0) {
+			xcb_close_font(wm.conn, f.id);
+			continue;
+		}
+		/* CJK を覆っていない補助フォントには意味が無い（「一」で確かめる） */
+		jis = name_is_jis0208(f.name);
+		if (jis ? !(f.min_byte1 <= 0x30 && f.max_byte1 >= 0x30)
+		        : !cf_covers(&f, 0x4E00u)) {
 			xcb_close_font(wm.conn, f.id);
 			continue;
 		}
 		g_aux = f;
+		g_aux_jis = jis;
 		g_have_aux = true;
-		LOG("font: CJK 補助フォント: %s", g_aux.name);
+		LOG("font: CJK 補助フォント: %s%s", g_aux.name,
+		    jis ? "（JIS X 0208 の区点で引く）" : "");
 		return;
 	}
 	LOG("font: CJK 補助フォントは見つからなかった（該当文字は豆腐になる: §4.5.5）");
@@ -841,6 +910,7 @@ bool font_init(const char *configured)
 	memset(&g_pri, 0, sizeof(g_pri));
 	memset(&g_aux, 0, sizeof(g_aux));
 	g_have_aux = false;
+	g_aux_jis  = false;
 	g_builtin  = false;
 	g_ready    = false;
 	g_ellipsis_w = -1;
@@ -951,6 +1021,7 @@ void font_fini(void)
 	g_pri.open = false;
 	g_aux.open = false;
 	g_have_aux = false;
+	g_aux_jis = false;
 	g_atlas = XCB_NONE;
 	g_gc = XCB_NONE;
 	g_builtin = false;
@@ -960,6 +1031,11 @@ void font_fini(void)
 const char *font_describe(void)
 {
 	return g_desc[0] != '\0' ? g_desc : "none";
+}
+
+bool font_has_cjk(void)
+{
+	return g_ready && !g_builtin && g_have_aux;
 }
 
 uint16_t font_ascent(void)
@@ -1026,15 +1102,10 @@ static uint32_t query_runs_width(const uint16_t *s, size_t n)
 	if (n == 0)
 		return 0;
 
-	for (i = 0; i < n; i++) {
-		chars[i].byte1 = (uint8_t)(s[i] >> 8);
-		chars[i].byte2 = (uint8_t)(s[i] & 0xFFu);
-	}
-
 	i = 0;
 	while (i < n && nrun < FONT_MAX_RUNS) {
 		xcb_font_t f = font_for(s[i]);
-		size_t j = i + 1;
+		size_t j = i + 1, k;
 
 		/* 最後のランは残り全部を飲み込む（ラン数の上限対策） */
 		if (nrun + 1 == FONT_MAX_RUNS)
@@ -1042,6 +1113,13 @@ static uint32_t query_runs_width(const uint16_t *s, size_t n)
 		else
 			while (j < n && font_for(s[j]) == f)
 				j++;
+
+		for (k = i; k < j; k++) {
+			uint16_t code = code_for(f, s[k]);
+
+			chars[k].byte1 = (uint8_t)(code >> 8);
+			chars[k].byte2 = (uint8_t)(code & 0xFFu);
+		}
 
 		ck[nrun++] = xcb_query_text_extents(wm.conn, f,
 		                                    (uint32_t)(j - i), &chars[i]);
@@ -1262,8 +1340,10 @@ static size_t polytext_build(const uint16_t *s, size_t n, xcb_font_t *last_font)
 		g_items[pos++] = (uint8_t)cnt;
 		g_items[pos++] = 0;                           /* delta */
 		for (k = 0; k < cnt; k++) {
-			g_items[pos++] = (uint8_t)(s[i + k] >> 8);
-			g_items[pos++] = (uint8_t)(s[i + k] & 0xFFu);
+			uint16_t code = code_for(f, s[i + k]);
+
+			g_items[pos++] = (uint8_t)(code >> 8);
+			g_items[pos++] = (uint8_t)(code & 0xFFu);
 		}
 		i = j;
 	}

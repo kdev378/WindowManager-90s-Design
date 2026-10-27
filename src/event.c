@@ -285,6 +285,23 @@ static void on_button_press(xcb_button_press_event_t *e)
 	static uint8_t         last_click_part;
 	bool dbl;
 
+	/*
+	 * クライアント窓そのものに張った click-to-focus の grab 経由
+	 * (focus.c の focus_grab_buttons)。アクティブにして前へ出し、
+	 * クリックは ReplayPointer でアプリへそのまま渡す。
+	 * 装飾の当たり判定はしない（座標がクライアント窓基準なので）。
+	 */
+	if (!c) {
+		struct client *cc = client_find(e->event);
+
+		if (cc != NULL && cc->win == e->event) {
+			/* 前に出すかは focus.raise に従う (focus_set が面倒を見る) */
+			focus_set(cc, e->time);
+			xcb_allow_events(wm.conn, XCB_ALLOW_REPLAY_POINTER, e->time);
+			return;
+		}
+	}
+
 	if (!c)
 		c = client_find(e->child);
 	if (!c) {
@@ -651,14 +668,12 @@ void event_dispatch(xcb_generic_event_t *ev)
 	case XCB_ENTER_NOTIFY:
 		on_enter_notify((xcb_enter_notify_event_t *)ev);
 		break;
-	case XCB_FOCUS_IN:
-	case XCB_FOCUS_OUT: {
-		/* キャプションの配色がアクティブ/非アクティブで変わる (§4.4) */
-		struct client *fc = client_find(((xcb_focus_in_event_t *)ev)->event);
-		if (fc && (fc->flags & CF_DECORATED))
-			deco_draw(fc, NULL);
-		break;
-	}
+	/*
+	 * FocusIn/FocusOut はここで扱わない。キャプションの描き直しは
+	 * focus.c が ST_FOCUSED を書き換えた場所で行う（理由は focus.c の
+	 * redraw_caption() を参照）。以前ここにあったハンドラは、
+	 * FOCUS_CHANGE を誰も select していなかったため一度も動いていなかった。
+	 */
 	case XCB_MAPPING_NOTIFY:
 		input_regrab_keys();
 		break;

@@ -24,6 +24,7 @@
 
 #define TB_START_W       54    /* スタートボタンの最小幅 (§4.8)。実幅は文字幅次第 */
 #define TB_START_LABEL   "スタート"
+#define TB_START_LABEL_C "Start"   /* 日本語フォントが無いとき (豆腐を避ける) */
 #define TB_BTN_MAX_W    160    /* タスクボタンの上限幅 */
 #define TB_BTN_MIN_W     44    /* 下限。これ以下には縮めない (§4.8) */
 #define TB_GAP            2
@@ -204,6 +205,17 @@ static void draw_button(xcb_drawable_t d, const struct tb_button *b, uint16_t id
 	}
 }
 
+/*
+ * スタートボタンの文言。CJK 補助フォントが無いと「スタート」は
+ * □□□□ になる（外部テストで発見）。読めない日本語より英語の方がよい。
+ * フォントは起動時に決まって以後変わらない (SIGHUP の再読み込みでも
+ * font_init は呼ばない) ので、幅の計測と描画で食い違うことはない。
+ */
+static const char *start_label(void)
+{
+	return font_has_cjk() ? TB_START_LABEL : TB_START_LABEL_C;
+}
+
 static void draw_start(xcb_drawable_t d)
 {
 	const struct metrics *m = theme_metrics();
@@ -212,7 +224,7 @@ static void draw_start(xcb_drawable_t d)
 	uint16_t w = tb.start_w;
 	uint16_t h = (uint16_t)(tb.geom.h - 2 * (TB_GAP + 1));
 	int16_t gx, gy, tx;
-	static const char label[] = TB_START_LABEL;
+	const char *label = start_label();
 
 	(void)m;
 
@@ -228,7 +240,7 @@ static void draw_start(xcb_drawable_t d)
 	font_draw(d, tx,
 	          (int16_t)(y + (int16_t)(h - font_height()) / 2 + (int16_t)font_ascent()
 	                    + (pressed ? 1 : 0)),
-	          label, sizeof label - 1, wm.cfg.color[THEME_WINDOW_TEXT]);
+	          label, strlen(label), wm.cfg.color[THEME_WINDOW_TEXT]);
 }
 
 static void draw_clock(xcb_drawable_t d)
@@ -360,7 +372,8 @@ void taskbar_init(void)
 	 * 文字が切れる。ここで一度だけ測る（描画経路では測らない。§4.5.2.1）。
 	 */
 	{
-		uint16_t lw = font_text_width(TB_START_LABEL, sizeof TB_START_LABEL - 1);
+		const char *label = start_label();
+		uint16_t lw = font_text_width(label, strlen(label));
 		uint16_t need = (uint16_t)(4 + GLYPH_FLAG_W + 3 + lw + 8);
 		uint16_t min_w = (uint16_t)(TB_START_W * m->scale);
 		tb.start_w = need > min_w ? need : min_w;

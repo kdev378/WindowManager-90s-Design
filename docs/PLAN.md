@@ -38,10 +38,13 @@ IceWM や Openbox はさらに大きい。装飾を持たない軽量 WM（dwm �
 
 - `Makefile`（POSIX make。GNU make / BSD make 双方で動くこと。cmake/meson は使わない）
   - `make`（core プロファイル）, `make DEBUG=1`, `make XFT=1`, `make STATIC=1`, `make install`
+    - **2026-10-27 時点**: `DEBUG=1` / `STATIC=1` / `NO_SHAPE=1` は実装済み。`XFT=1` は未実装で、
+      黙って core を作らずエラーで止める（外部テストで「指定しても同じバイナリができる」と指摘された）
   - 依存検出は `pkg-config` があれば使い、無ければ既定パスにフォールバック
   - **必須依存**: `xcb`, `xcb-randr`, `xcb-sync`, `xcb-keysyms`
     （`xcb-sync` は `_NET_WM_SYNC_REQUEST` に必要。SPEC §1.4）
-  - **任意依存**: `xcb-shape`, `xcb-xfixes`（無い場合は該当機能を無効化してビルド継続）
+  - **任意依存**: `xcb-shape`（無い場合は矩形扱いに縮退してビルド継続）。
+    `xcb-xfixes` は不要と判明（SPEC §1.4 の表を参照）
 - `src/atoms.c` — アトムテーブルと `implemented` フラグ（SPEC §5.2.1）。
   `_NET_SUPPORTED` はこのフラグから生成する。フェーズ進行に伴って昇格させる
 - `src/compat.h` — Linux / OpenBSD の差分吸収（`strlcpy`, `pledge`, `posix_spawn`, poll）
@@ -54,6 +57,7 @@ IceWM や Openbox はさらに大きい。装飾を持たない軽量 WM（dwm �
   0 枚の測定（M0/M1）を Phase 0 の時点から取り始めることで、以降のフェーズで
   「常駐の底が上がった」のか「ウィンドウ単価が増えた」のかを毎回切り分けられるようにする
 - `tools/compat-matrix.sh` — §7.1 のアプリを順に起動し、手動確認用チェックリストを出す
+  （長らく未作成のまま PLAN にだけ載っていた。外部テストの指摘で 2026-10-27 に作成）
 - `tools/check-supported.sh` — `_NET_SUPPORTED` に載っている各アトムに対応する結合テストが
   存在するかを機械的に検査する（SPEC §5.2.1。テストの無いアトムが載っていたら CI 失敗）
 - GitHub Actions:
@@ -273,6 +277,27 @@ Phase 4 で見つけて直した既存の不具合:
   （4 種すべて select したプローブで 1 件も届かないことを確認）ため、
   この環境では踏めない。**VM のウィンドウをリサイズすれば即座に踏める**
   ので、`docs/MANUAL-TEST.md` §4-G を最優先で見てほしい。
+
+### 外部テスト（2026-10-27、Ubuntu 24.04、HEAD 9c6a7a8）の所見と対応
+
+テストと報告は別担当、修正はこちら、の分業で行った。所見ごとの対応:
+
+| 所見 | 内容 | 対応 |
+| --- | --- | --- |
+| 0 | `make test` の一括実行で「WM が起動直後に終了」がランダムに出る | 原因は 2 つ。(a) 8 本のテストが `trap 'cleanup_tmp' EXIT` で lib.sh の後始末を**上書き**しており Xvfb と WM が残っていた（trap は後勝ち）。(b) 死にかけの旧 Xvfb に疎通確認が成功してしまう起動レース。trap を合成し、`run-tests.sh` に「`_lib_cleanup` を潰す trap があれば Bail out」の検査を追加。`start_xvfb` は自分の Xvfb の生存を確かめ、駄目なら次の番号で再試行する |
+| 0' | `160` が負荷時にだけ落ちる（既知のフレークとして記録していたもの） | **テスト側の不具合**。検証クライアントが `xcb_flush` 直後に終了しており、負荷の高い X サーバは「データ + 切断」を同時に見て要求ごと捨てることがある。WM のログには該当のクライアントメッセージが 1 件も届いていなかった。終了前に往復を 1 回挟むよう直した（`180` も同じ）。4 コアに負荷をかけた状態で 3/3 通過 |
+| 1 | アクティブが変わってもキャプションの色が変わらない | `FocusIn` で描き直す作りだったが、FOCUS_CHANGE を select しておらずハンドラが一度も呼ばれていなかった。`focus_set()` / `focus_none()` で新旧両方を描き直す。**調べる過程で「窓の中身をクリックしてもアクティブにならない」も発見**（click-to-focus のパッシブ grab が無かった）。非アクティブな窓にだけ `GrabModeSync` の grab を張り、`AllowEvents(ReplayPointer)` でクリックをアプリにも届ける。`055-click-to-focus.sh` を追加 |
+| 2 | `make XFT=1` / `DEBUG=1` / `STATIC=1` が黙って無視される。xcb-shape が必須扱い。pkg-config の全か無か | 上の Phase 0 の注記のとおり。`.buildcfg` でフラグの変化を検出して作り直す。GNU make と bmake で同一バイナリになることを確認 |
+| 3 | 未知の引数が黙って無視される | usage を出して終了コード 2。`tests/unit/020-cli-args.sh` |
+| 4 | MANUAL-TEST の本数が古い | 更新 |
+| 5 | 日本語が豆腐。COMPOUND_TEXT のタイトルが化ける | 豆腐の原因は「欧文の iso10646-1 フォントは範囲だけ CJK を覆う」ので補助フォントを開いていなかったこと。jisx0208 フォントは区点で引く必要があるのに UCS のまま渡していた。COMPOUND_TEXT は Latin-1 として読んでいた。いずれも SPEC §2.3.1 / §4.5.4 に記載。`075-cjk-title.sh`（2 つのフォント環境）と `tests/unit/010-text-codec.sh` を追加 |
+| 6 | valgrind の `writev` 未初期化 1 件 | `--track-origins` で辿ると libxcb-randr の `xcb_randr_get_monitors()` の末尾パディング。w98wm の外。`tools/valgrind.supp` に理由つきで抑制し、`190-valgrind.sh` でそれ以外が 0 件であることを毎回確認する |
+| 他 | `tools/compat-matrix.sh` が無い | 作成 |
+| 他 | 設定ファイルが無いのに「設定の font を開けなかった」と出る | 既定値に helvetica が入っていた（SPEC §4.5.1 の候補 1 は指定時のみ）。既定を空にした。Tahoma が入っていても helvetica が先に勝つ不具合も同時に解消 |
+
+所見 0 の (b) と 0' は、どちらも「WM は正しく、テストが間違っていた」種類だった。
+**テストのフレークは WM の不具合と区別がつかない**ので、原因を特定するまで
+「既知のフレーク」で済ませないこと。
 
 ---
 

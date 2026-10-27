@@ -43,11 +43,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
             libxcb1-dev libxcb-randr0-dev libxcb-sync-dev \
-            libxcb-keysyms1-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcb-keysyms1-dev libxcb-shape0-dev \
             xvfb xterm xdotool wmctrl x11-utils \
             valgrind \
-            xfonts-base xbitmaps \
+            xfonts-base xfonts-intl-japanese xfonts-utils xbitmaps \
             imagemagick
+
+      - name: ビルドの切り替え (DEBUG / NO_SHAPE / XFT は止まること)
+        run: |
+          make CC=${{ matrix.cc }} DEBUG=1
+          make CC=${{ matrix.cc }} NO_SHAPE=1
+          if make CC=${{ matrix.cc }} XFT=1; then
+            echo "XFT=1 は未実装なのでエラーで止まるべき" >&2
+            exit 1
+          fi
 
       - name: ビルド (${{ matrix.cc }}, core プロファイル)
         run: make CC=${{ matrix.cc }}

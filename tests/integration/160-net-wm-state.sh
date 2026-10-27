@@ -40,7 +40,8 @@ require_tool xterm
 
 TMP=$(mktemp -d)
 cleanup_tmp() { rm -rf "$TMP" 2>/dev/null || true; }
-trap 'cleanup_tmp' EXIT
+# trap は後勝ち。lib.sh の _lib_cleanup と必ず合成する（単独で張ると Xvfb と WM が残る）
+trap '_lib_cleanup; cleanup_tmp' EXIT INT TERM
 
 cat >"$TMP/setstate.c" <<'EOF'
 /*
@@ -116,7 +117,15 @@ int main(int argc, char **argv)
 	xcb_send_event(c, 0, s->root,
 		XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,
 		(const char *)&ev);
-	xcb_flush(c);
+	/*
+	 * ★ flush だけで抜けてはいけない。往復を 1 回挟んで、サーバが
+	 *   SendEvent を処理し終えたことを確かめてから切断する。
+	 *   負荷が高いとサーバは「データ + 切断」を同時に見て、未処理の
+	 *   要求ごと接続を捨てることがある（実際に 160 がそれで落ちた）。
+	 *   xdotool / wmctrl は XCloseDisplay が XSync するので起きない。
+	 */
+	free(xcb_get_input_focus_reply(c, xcb_get_input_focus(c), NULL));
+	xcb_disconnect(c);
 	return 0;
 }
 EOF

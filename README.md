@@ -11,10 +11,11 @@ Windows 98 のルック＆フィールを再現する、X11 用の超軽量リ�
 - タスクバー・スタートメニュー・システムトレイを内蔵（無効化可能）
 
 ビルドプロファイルは 2 つあります。**core**（既定）は libxcb 系のみで、メモリ目標が
-適用されます。**xft**（`make XFT=1`）はアンチエイリアスと確実な多言語表示が得られる
-代わりに、fontconfig/FreeType 依存となりメモリ目標の対象外です。
-core ビルドでの日本語タイトル表示は、環境にある X コアフォント次第の best-effort です
-（詳細は SPEC §4.5.5）。
+適用されます。**xft**（`make XFT=1`）はアンチエイリアスと確実な多言語表示のための
+予定のプロファイルで、**まだ実装していません**（`make XFT=1` はエラーで止まります）。
+core ビルドでの日本語タイトル表示は、環境にある X コアフォント次第の best-effort です。
+`xfonts-base` の `12x13ja` か `xfonts-intl-japanese` の `k14` 等があれば日本語が出ます
+（詳細は SPEC §4.5.4–4.5.5）。
 
 ## ドキュメント
 
@@ -31,9 +32,13 @@ core ビルドでの日本語タイトル表示は、環境にある X コアフ
 **Phase 4 完了** — タスクバー・スタートメニュー・システムトレイ・Alt+Tab まで動きます。
 
 ```
-make          # ビルド (依存: libxcb, xcb-randr, xcb-sync, xcb-keysyms, xcb-shape)
-make test     # Xvfb 上で結合テスト (18 本)
+make          # ビルド (依存: libxcb, xcb-randr, xcb-sync, xcb-keysyms。xcb-shape は任意)
+make test     # 単体テスト 2 本 + Xvfb 上の結合テスト 21 本
 make memcheck # メモリ実測 (SPEC §9.1)
+
+make DEBUG=1  # -O0 -g3 (gdb 用)。フラグが変わると全部作り直す
+make STATIC=1 # 静的リンク (experimental。.a が揃っていること)
+make NO_SHAPE=1  # xcb-shape を使わない (無い環境の再現)
 ```
 
 動くもの: Win98 の枠・タイトルバー・キャプションボタン・ウィンドウメニュー・カーソル、
@@ -49,14 +54,15 @@ make memcheck # メモリ実測 (SPEC §9.1)
 各項目の状態は [docs/PLAN.md](docs/PLAN.md) の「Phase 4 の結果」を参照。
 
 何がどこまで検証されているかは [docs/TRACEABILITY.md](docs/TRACEABILITY.md)
-に一覧があります（**未検証の 12 項目も優先度付きで明記**）。
+に一覧があります（**未検証の項目も優先度付きで明記**）。
 実環境での手動検証は [docs/MANUAL-TEST.md](docs/MANUAL-TEST.md)。
+§7.1 のアプリを順に起動してチェックリストを出す `tools/compat-matrix.sh` もあります。
 
 | 指標 | 実測 | 目標 | 判定 |
 | --- | --- | --- | --- |
-| Private_Dirty (0 窓・タスクバー無効) | 248 KB | < 400 KB | PASS |
-| Private_Dirty (0 窓・タスクバー/トレイ有効) | 252 KB | < 550 KB | PASS |
-| Private_Dirty (20 窓) | 276 KB | < 1024 KB | PASS |
+| Private_Dirty (0 窓・タスクバー無効) | 252 KB | < 400 KB | PASS |
+| Private_Dirty (0 窓・タスクバー/トレイ有効) | 256 KB | < 550 KB | PASS |
+| Private_Dirty (20 窓) | 280 KB | < 1024 KB | PASS |
 | 窓あたりの限界費用 | 1.2 KB | < 2 KB | PASS |
 | 1 時間 + 500 回の開閉/移動/リサイズ後 | 272 KB (**−4 KB**) | 増分 < 32 KB | PASS |
 

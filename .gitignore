@@ -2,7 +2,8 @@
 *.o
 *.a
 /w98wm
-tests/unit/unit_tests
+.buildcfg
+.buildcfg.new
 
 # エディタ・OS
 *.swp

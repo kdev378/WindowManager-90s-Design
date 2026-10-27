@@ -220,10 +220,23 @@ int main(int argc, char **argv)
 		} else if (strcmp(argv[i], "--print-font") == 0) {
 			/* §4.5.1: どの候補が採用されたかを確認する手段 */
 			print_font_only = 1;
-		} else if (strcmp(argv[i], "--help") == 0) {
+		} else if (strcmp(argv[i], "--replace") == 0) {
+			/* wm_init() が自分で拾う。ここでは既知として通すだけ */
+		} else if (strcmp(argv[i], "--help") == 0 ||
+		           strcmp(argv[i], "-h") == 0) {
 			printf("usage: %s [-v] [--replace] [--version] [--print-font]\n",
 			       argv[0]);
 			return 0;
+		} else {
+			/*
+			 * 知らない引数で黙って起動しない。`--replase` のような打ち間違いが
+			 * 「既に WM が動いている」という別のエラーに化けて分かりにくい
+			 * （外部テストで指摘）。
+			 */
+			fprintf(stderr, "%s: 不明な引数: %s\n", argv[0], argv[i]);
+			fprintf(stderr, "usage: %s [-v] [--replace] [--version] [--print-font]\n",
+			        argv[0]);
+			return 2;
 		}
 	}
 

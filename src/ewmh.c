@@ -819,9 +819,16 @@ size_t prop_get_text(xcb_window_t w, xcb_atom_t prop, char *buf, size_t buflen)
 		size_t copy_len = utf8_truncate_len(data, (size_t)vlen, buflen - 1);
 		memcpy(buf, data, copy_len);
 		out_len = copy_len;
-	} else if (r->type == XCB_ATOM_STRING ||
-	           r->type == atoms[ATOM_COMPOUND_TEXT]) {
-		/* Latin-1 -> UTF-8 (STRING/COMPOUND_TEXT を Latin-1 とみなす簡易変換) */
+	} else if (r->type == atoms[ATOM_COMPOUND_TEXT]) {
+		/*
+		 * ISO 2022 のエスケープを解釈する (ctext.c)。Latin-1 とみなすと
+		 * `xterm -T 日本語` のタイトルが ESC $ B の生バイトのまま化ける。
+		 * 途中で切れたマルチバイトは後段の utf8_truncate_len が落とす。
+		 */
+		out_len = ctext_to_utf8((const uint8_t *)data, (size_t)vlen,
+		                        buf, buflen - 1);
+	} else if (r->type == XCB_ATOM_STRING) {
+		/* STRING は ICCCM の定義どおり Latin-1 -> UTF-8 */
 		for (int i = 0; i < vlen; i++) {
 			uint8_t ch = (uint8_t)data[i];
 			size_t need = (ch < 0x80) ? 1 : 2;

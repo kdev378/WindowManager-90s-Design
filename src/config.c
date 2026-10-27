@@ -222,15 +222,15 @@ void config_defaults(struct config *cfg)
 	 * color[16] は THEME_* で索引される配列だが、その enum は theme.c
 	 * (Phase 2) が定義する。ここでは絶対に色定数を捏造しない。ゼロ初期化
 	 * のまま theme.c 側の初期化に委ねる（上の memset で既にゼロ）。 */
-	/* strlcpy() は使わない。compat.h は glibc>=2.38 なら <string.h> の
-	 * strlcpy をそのまま使う想定だが、glibc はこれを __USE_MISC
-	 * (_DEFAULT_SOURCE/_GNU_SOURCE) 配下でしか宣言しない。本ビルドは
-	 * -D_POSIX_C_SOURCE=200809L のみを立てるため未宣言になり、
-	 * -Wimplicit-function-declaration に触れる（compat.h 側の前提の
-	 * 抜け穴。詳細は報告に記載）。snprintf は C99 標準で常に使えるので
-	 * こちらで代用する。 */
-	snprintf(cfg->font, sizeof(cfg->font), "%s",
-	        "-*-helvetica-medium-r-normal--11-*-*-*-p-*-iso10646-1");
+	/*
+	 * 既定は**空**。SPEC §4.5.1 の候補 1 は「設定ファイルで指定したときだけ」
+	 * 試すもの。ここに helvetica を入れていた頃は、
+	 *   - helvetica の無い最小環境で、設定ファイルが無いのに毎回
+	 *     「設定の font を開けなかった」と出ていた（外部テストで指摘）
+	 *   - 候補 2 の Tahoma が入っていても helvetica が先に勝っていた
+	 * helvetica は候補 3 として font.c の既定の候補列に入っている。
+	 */
+	cfg->font[0] = '\0';
 	cfg->scale = 1;
 
 	/*

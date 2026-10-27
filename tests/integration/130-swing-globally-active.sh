@@ -39,7 +39,8 @@ SRC="$ROOT_DIR/tools/SwingTest.java"
 
 TMP=$(mktemp -d)
 cleanup_tmp() { rm -rf "$TMP" 2>/dev/null || true; }
-trap 'cleanup_tmp' EXIT
+# trap は後勝ち。lib.sh の _lib_cleanup と必ず合成する（単独で張ると Xvfb と WM が残る）
+trap '_lib_cleanup; cleanup_tmp' EXIT INT TERM
 
 javac -d "$TMP/classes" "$SRC" >"$TMP/javac.log" 2>&1 ||
 	skip "SwingTest.java をコンパイルできません: $(tail -3 "$TMP/javac.log")"
@@ -57,8 +58,19 @@ _LIB_PIDS="$_LIB_PIDS $JAVA_PID"
 # xdotool search を使わない理由は lib.sh の wait_for_managed_window を参照
 # (Java は表に出ない補助ウィンドウを作るので、名前で引くと先にそちらが当たる)。
 win=$(wait_for_managed_window "Swing" 25) || win=""
-[ -n "$win" ] ||
-	fail "Swing の窓が管理下に入りませんでした: $(tail -5 "$TMP/app.err" 2>/dev/null)"
+if [ -z "$win" ]; then
+	#
+	# headless 版の JRE (Ubuntu の openjdk-*-jre-headless 等) には
+	# libawt_xawt.so が無く、Swing が窓を出せない。これは製品の問題ではない。
+	# Java のスタックトレースの末尾だけを出すと原因行が埋もれるので
+	# （外部テストで指摘）、見分けて skip する。
+	#
+	if grep -q -e 'UnsatisfiedLinkError' -e 'HeadlessException' -e 'libawt_xawt' \
+	        "$TMP/app.err" 2>/dev/null; then
+		skip "JRE が headless 版で GUI を出せません (libawt_xawt.so が無い)。openjdk-*-jre (headless でない方) を入れてください"
+	fi
+	fail "Swing の窓が管理下に入りませんでした: $(grep -m3 -e 'Exception' -e 'Error' "$TMP/app.err" 2>/dev/null || tail -5 "$TMP/app.err" 2>/dev/null)"
+fi
 sleep 2
 
 # ------------------------------------------------------------------

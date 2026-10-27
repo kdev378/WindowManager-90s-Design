@@ -27,7 +27,7 @@ Xvfb 上の自動テストで確認済みなのは
 
 ```sh
 make            # まずこれが通るか
-make test       # 18 本すべて ok か
+make test       # 23 本 (単体 2 + 結合 21) すべて ok か
 make memcheck   # M0/M1/M20 が PASS か（arm64 の実測値が知りたい）
 ```
 
@@ -87,22 +87,25 @@ Debian のインストーラで「ソフトウェアの選択」まで来たら�
 sudo apt update
 sudo apt install -y xserver-xorg xinit x11-utils x11-xserver-utils \
                     xterm xdotool wmctrl imagemagick \
-                    fonts-vlgothic fonts-ipafont \
+                    xfonts-base xfonts-intl-japanese valgrind \
                     build-essential pkg-config git \
                     libxcb1-dev libxcb-randr0-dev libxcb-sync-dev \
                     libxcb-keysyms1-dev libxcb-shape0-dev
 ```
 
-`fonts-vlgothic` / `fonts-ipafont` は日本語タイトルの検証に要ります。
-**core ビルドの日本語表示は環境の X コアフォント次第**なので、
-何が入っているかが検証結果そのものになります。
+`xfonts-base`（`12x13ja` を含む）と `xfonts-intl-japanese`（`k14` 等の
+`jisx0208` フォント）は日本語タイトルの検証に要ります。
+**core ビルドが使うのは X の「コアフォント」だけ**なので、`fonts-vlgothic` や
+`fonts-ipafont` のような TrueType は（X サーバのフォントパスに足さない限り）
+使われません。何が入っているかが検証結果そのものになるので、
+`--print-font` の出力を報告に添えてください。
 
 ビルドして、`.xinitrc` に w98wm だけを書きます:
 
 ```sh
 git clone <このリポジトリ> ~/w98wm && cd ~/w98wm
 make
-make test                     # ここで 13 本すべて ok になるはず
+make test                     # ここで 23 本すべて ok になるはず (単体 2 + 結合 21)
 
 cat > ~/.xinitrc <<'XINIT'
 # w98wm だけを唯一のクライアントとして起動する。
@@ -146,7 +149,7 @@ VM ではなく手元に画面が無いマシンで試す場合は、VNC を挟�
 
 ```sh
 sudo apt install -y tigervnc-standalone-server xterm x11-utils \
-                    x11-xserver-utils xdotool wmctrl imagemagick fonts-vlgothic
+                    x11-xserver-utils xdotool wmctrl imagemagick xfonts-base xfonts-intl-japanese
 
 vncpasswd                      # 初回だけ
 Xvnc :1 -geometry 1280x800 -depth 24 -rfbport 5901 \
@@ -263,6 +266,11 @@ DISPLAY=:1 java tools/SwingTest.java
 | Firefox とエディタを交互にクリック | クリックしたほうがアクティブになり、前のは灰色に | 同上 |
 | Firefox でリンクを新しいウィンドウで開く | **新しい窓が勝手に前に出ずタスクバーのボタンが点滅**、または前に出る（どちらでもよいが挙動が一貫していること） | `_NET_WM_USER_TIME` によるフォーカススティール防止（SPEC §3.6） |
 
+> 2 行目（窓の**中身**のクリックでアクティブが移る・キャプションの色が入れ替わる）は
+> 2026-10-27 の外部テストまで**両方とも壊れていました**（直したのは同日。
+> `055-click-to-focus.sh` で自動検証）。クリックがアプリにも届くこと
+> （例: Firefox のリンクを、非アクティブな状態から 1 回のクリックで開ける）も見てください。
+
 ### B. リサイズ（GTK アプリ）
 
 | 手順 | 期待 | これが崩れていたら |
@@ -306,13 +314,21 @@ DISPLAY=:1 java tools/SwingTest.java
 
 | 手順 | 期待 |
 | --- | --- |
-| `DISPLAY=:1 ./w98wm --print-font` | 採用されたフォント名が出る |
-| 日本語のファイル名でエディタを開く | タイトルバーに日本語が出る |
+| `DISPLAY=:1 ./w98wm --print-font`（WM を止めた状態で） | 採用されたフォント名が出る。日本語フォントがあれば末尾に `+ aux ...-ja-...` か `+ aux ...jisx0208.1983-0` が付く |
+| スタートボタン | 補助フォントがあれば「スタート」、無ければ「Start」（豆腐にはしない） |
+| 日本語のファイル名でエディタを開く | タイトルバーとタスクバーに日本語が出る |
+| `LANG=ja_JP.UTF-8 xterm -T 日本語タイトル` | 同上。この xterm は `WM_NAME` を **COMPOUND_TEXT** で書く（`xprop WM_NAME` で型が見える）。化けた欧文になったらバグ |
 
 **ここは best-effort です**（core ビルドは X コアフォントしか使わないため）。
-豆腐（□）になる、CJK だけ描画されない、といった結果でも
-**それが分かること自体が成果**なので、`--print-font` の出力と一緒に報告してください。
-実用に耐えないようなら `make XFT=1` の xft ビルドを整備します。
+`--print-font` に `+ aux` が付いていないのに日本語が出ないのは仕様どおりです。
+`+ aux` が付いているのに豆腐になる場合はバグなので、`--print-font` の出力と
+スクリーンショットを送ってください。
+（`xft` ビルドは未実装です。`make XFT=1` はエラーで止まります。）
+
+> 2026-10-27 の外部テストで、`12x13ja` があるのに豆腐になる・COMPOUND_TEXT が
+> 化ける、の 2 つが見つかって直しました。Xvfb 上の `075-cjk-title.sh` で
+> 「既定のフォントパス」「`k14` しか無いフォントパス」の両方を検証していますが、
+> 実機の Xorg で同じになるかは未確認です。
 
 ### G. モニタ構成の変化（**ここを最優先で見てほしい**）
 
@@ -347,6 +363,19 @@ RandR の変更通知が飛びます（SPEC §5.3 の経路そのもの）。
 
 ---
 
+### H. 互換性マトリクス（まとめて確認したいとき）
+
+```sh
+sh tools/compat-matrix.sh > compat.md    # w98wm の下の端末で
+```
+
+SPEC §7.1 のアプリのうち**インストール済みのもの**を 1 つずつ起動し、
+WM の管理下に入ったかを自動で判定して、手で確認すべき点つきの表を
+Markdown で出します。結果欄に ✅ / ❌ を書き込めばそのまま報告に使えます。
+`--list` で起動せず表だけ、`--keep` で起動したアプリを閉じずに残します。
+
+---
+
 ## 5. 不具合を見つけたときに送ってほしいもの
 
 ```sh
@@ -365,6 +394,13 @@ DISPLAY=:1 import -window root /tmp/shot.png
 ```
 
 この 4 点があれば、こちらで Xvfb 上に同じ状況を再現できることが多いです。
+
+**valgrind で見る場合**は抑制ファイルを付けてください。libxcb-randr 由来の
+既知の 1 件（無害。理由はファイル内に記載）を除外します。それ以外が出たら報告対象です:
+
+```sh
+valgrind --suppressions=tools/valgrind.supp --track-origins=yes ./w98wm
+```
 
 **WM が固まった / 画面が真っ暗になった場合**: 別の SSH セッションから
 `pkill w98wm` で落とせます。X サーバ（Xvnc）は生き残るので、

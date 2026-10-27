@@ -54,7 +54,8 @@ SMALL_TOP=$((BORDER + CAPTION_SMALL))
 
 TMP=$(mktemp -d)
 cleanup_tmp() { rm -rf "$TMP" 2>/dev/null || true; }
-trap 'cleanup_tmp' EXIT
+# trap は後勝ち。lib.sh の _lib_cleanup と必ず合成する（単独で張ると Xvfb と WM が残る）
+trap '_lib_cleanup; cleanup_tmp' EXIT INT TERM
 
 cat >"$TMP/typed.c" <<'EOF'
 /*

@@ -86,6 +86,20 @@ _reap_leaked_servers() {
 	for p in $leaked; do
 		kill -9 "$p" 2>/dev/null || true
 	done
+
+	# ★ 消えるまで待つ。待たずに次のテストへ進むと、まだソケットを
+	#   握っている旧 Xvfb と次のテストの Xvfb が同じ番号を取り合い、
+	#   「X サーバに接続できない」の起動レースになる（外部テストで発見）。
+	i=0
+	while [ $i -lt 30 ]; do
+		alive=0
+		for p in $leaked; do
+			kill -0 "$p" 2>/dev/null && alive=1
+		done
+		[ "$alive" -eq 0 ] && break
+		sleep 0.1
+		i=$((i + 1))
+	done
 }
 
 run_one() {
@@ -150,6 +164,27 @@ if [ -d "$UNIT_DIR" ]; then
 	done
 else
 	echo "# tests/unit が無いためスキップします"
+fi
+
+# --- テストスクリプト自体の検査 ---
+#
+# trap は後勝ちなので、テストが独自の trap を張るときは lib.sh の
+# _lib_cleanup を**合成**しなければならない。忘れると Xvfb と WM が
+# 残り続け、後続テストの起動レースの原因になる（外部テストで 8 本が
+# これに該当していた）。書き忘れを機械的に止める。
+if [ -d "$INTEG_DIR" ]; then
+	bad_trap=""
+	for t in "$INTEG_DIR"/*.sh; do
+		[ "$(basename "$t")" = "lib.sh" ] && continue
+		if grep -q '^trap ' "$t" && ! grep '^trap ' "$t" | grep -q '_lib_cleanup'; then
+			bad_trap="$bad_trap $(basename "$t")"
+		fi
+	done
+	if [ -n "$bad_trap" ]; then
+		echo "Bail out! 次のテストの trap が lib.sh の _lib_cleanup を潰しています:$bad_trap"
+		echo "#   trap '_lib_cleanup; <自分の後始末>' EXIT INT TERM の形で合成してください"
+		exit 1
+	fi
 fi
 
 # --- 結合テスト (Xvfb + WM) ---

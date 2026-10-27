@@ -436,6 +436,21 @@ size_t utf8_to_ucs2(const char *src, size_t src_len,
 /* UTF-8 のコードポイント境界で安全に切り詰めた長さを返す (§2.3.1) */
 size_t utf8_truncate_len(const char *s, size_t len, size_t max);
 
+/*
+ * jis0208.c — JIS X 0208 ↔ UCS（自動生成の対応表。tools/gen-jis0208.py）
+ *   jis0208_to_ucs: 区点の 2 バイト (0x21-0x7E。bit7 は無視) → UCS。0 は未定義
+ *   ucs_to_jis0208: UCS → (b1 << 8 | b2)。0 は JIS X 0208 に無い
+ */
+uint16_t jis0208_to_ucs(uint8_t b1, uint8_t b2);
+uint16_t ucs_to_jis0208(uint16_t ucs);
+
+/*
+ * ctext.c — COMPOUND_TEXT → UTF-8 (§2.3.1)
+ *   dst に最大 dmax バイト書き、書いた長さを返す（NUL は付けない）。
+ *   読めない文字集合の字は '?' にする。
+ */
+size_t ctext_to_utf8(const uint8_t *src, size_t n, char *dst, size_t dmax);
+
 /* ================================================================== *
  * wm.c — 初期化・マネージャセレクション・adopt
  * ================================================================== */
@@ -525,6 +540,12 @@ void stack_update_client_list(void);       /* _NET_CLIENT_LIST(_STACKING) */
 void focus_set(struct client *c, xcb_timestamp_t time);
 void focus_none(void);                     /* focus_win へ退避 */
 void focus_next_after(struct client *closing);
+/*
+ * click-to-focus のパッシブ grab を張る/外す (§3.6)。
+ * 非アクティブな窓は grab、アクティブになったら外す。
+ * client_manage() で管理開始時に grab=true で呼ぶこと。
+ */
+void focus_grab_buttons(struct client *c, bool grab);
 void focus_mru_promote(struct client *c);
 void focus_mru_remove(struct client *c);
 struct client *focus_mru_first(uint32_t desktop);

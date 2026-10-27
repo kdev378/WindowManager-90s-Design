@@ -20,7 +20,8 @@ pkg-config --exists xcb xcb-sync 2>/dev/null || skip "xcb/xcb-sync がありま�
 
 TMP=$(mktemp -d)
 cleanup_tmp() { rm -rf "$TMP"; }
-trap 'cleanup_tmp' EXIT
+# trap は後勝ち。lib.sh の _lib_cleanup と必ず合成する（単独で張ると Xvfb と WM が残る）
+trap '_lib_cleanup; cleanup_tmp' EXIT INT TERM
 
 cat >"$TMP/probe.c" <<'EOF'
 /* WM の Phase 3 機能を突くための検証クライアント */

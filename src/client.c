@@ -568,6 +568,9 @@ struct client *client_manage(xcb_window_t win, bool adopting)
 	motif_update(c);               /* _MOTIF_WM_HINTS (§3.2) */
 	icon_update(c);                /* _NET_WM_ICON (§4.4.1) */
 	sync_client_init(c);           /* _NET_WM_SYNC_REQUEST (§7.3) */
+	/* click-to-focus。管理開始時は非アクティブなので grab を張る。
+	 * この直後に focus_set() されれば、そこで外れる (§3.6) */
+	focus_grab_buttons(c, true);
 
 	update_fixed_size(c);
 
@@ -725,6 +728,10 @@ void client_unmanage(struct client *c, bool destroyed)
 		if (c->flags & CF_ICONIC)
 			xcb_map_window(wm.conn, c->win);
 
+		/* click-to-focus の grab を外す (focus.c)。grab は WM の接続が持つので、
+		 * 外さないと管理を離れた窓のクリックを WM が横取りし続ける */
+		xcb_ungrab_button(wm.conn, XCB_BUTTON_INDEX_ANY, c->win, XCB_MOD_MASK_ANY);
+
 		/* セーブセットから外す (§3.1.1)。もう frame の子ではない。 */
 		xcb_change_save_set(wm.conn, XCB_SET_MODE_DELETE, c->win);
 
@@ -822,6 +829,13 @@ void client_iconify(struct client *c)
 	}
 
 	if (wm.focused == c) {
+		/*
+		 * wm.focused を NULL にするだけでは足りない。ST_FOCUSED が残ると、
+		 * 復元したときにフォーカスが無いのにアクティブ色で描かれ、
+		 * _NET_WM_STATE_FOCUSED も嘘を言い続ける。
+		 */
+		c->states &= ~(uint32_t)ST_FOCUSED;
+		ewmh_set_wm_state(c);
 		wm.focused = NULL;
 		focus_next_after(c);
 	}

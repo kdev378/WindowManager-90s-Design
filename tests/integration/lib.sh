@@ -78,52 +78,78 @@ _lib_cleanup() {
 }
 trap _lib_cleanup EXIT INT TERM
 
+#
+# 空いている表示番号を探す。ロックファイルだけでなく**ソケットも**見る。
+# 終了処理中の Xvfb はロックを先に消すので、ロックだけを見ると
+# まだソケットを握っているサーバの番号を「空き」と判断してしまう。
+#
 find_free_display() {
-	d=99
-	while [ -e "/tmp/.X${d}-lock" ]; do
+	d=${1:-99}
+	while [ -e "/tmp/.X${d}-lock" ] || [ -e "/tmp/.X11-unix/X${d}" ]; do
 		d=$((d + 1))
 	done
 	echo "$d"
 }
 
+#
 # start_xvfb: フレッシュな Xvfb を起動し、DISPLAY を export する。
+#
+# ★ 「自分が起動した Xvfb に繋がっている」ことまで確かめる。
+#
+#   外部テストで「WM が起動直後に終了しました (X サーバに接続できない)」が
+#   一括実行時だけランダムに 1〜2 本出ていた。経路はこう:
+#     1. 前のテストの Xvfb が終了処理中で、ロックは消えたがソケットはまだ握っている
+#     2. 新しい Xvfb は同じ番号で bind できず**即座に終了**する
+#     3. ところが疎通確認の xprop は**死にかけの旧サーバ**に繋がって成功する
+#     4. 直後に旧サーバが消え、WM の接続が失敗する
+#   疎通確認のあとに「自分の Xvfb がまだ生きているか」を見て、
+#   死んでいたら次の番号で起動し直す。
+#
+# XVFB_EXTRA_ARGS: Xvfb に足す引数（例: -fp <dir>/ でフォントパスを差し替える）。
+#   意図的に単語分割する。空白を含むパスは渡せない。
 start_xvfb() {
-	disp=$(find_free_display)
-	Xvfb ":$disp" -screen 0 1280x1024x24 -nolisten tcp >/tmp/w98wm-test-xvfb-$$.log 2>&1 &
-	XVFB_PID=$!
-	_LIB_PIDS="$_LIB_PIDS $XVFB_PID"
-	i=0
-	while [ ! -e "/tmp/.X${disp}-lock" ] && [ $i -lt 50 ]; do
-		sleep 0.1
-		i=$((i + 1))
-	done
-	[ -e "/tmp/.X${disp}-lock" ] || fail "Xvfb の起動に失敗しました"
+	_try=0
+	_from=99
+	while [ $_try -lt 5 ]; do
+		disp=$(find_free_display "$_from")
+		# shellcheck disable=SC2086
+		Xvfb ":$disp" -screen 0 1280x1024x24 -nolisten tcp ${XVFB_EXTRA_ARGS:-} \
+			>/tmp/w98wm-test-xvfb-$$.log 2>&1 &
+		XVFB_PID=$!
+		_LIB_PIDS="$_LIB_PIDS $XVFB_PID"
 
-	DISPLAY=":$disp"
-	export DISPLAY
+		DISPLAY=":$disp"
+		export DISPLAY
 
-	#
-	# ★ ロックファイルができた ≠ 接続を受け付けられる。
-	#
-	#   ロックは Xvfb が起動の**最初**に作る。実際にソケットで待ち受ける
-	#   までには少し間があり、その隙間に start_wm() が走ると WM が
-	#   接続に失敗して即座に終了する。テストからは
-	#   「WM が起動直後に終了しました」に見える。
-	#   負荷が低いときは間に合ってしまうので、**テストの本数が増えて
-	#   初めて顕在化する**たちの悪い競合になる。実際に 18 本にしたところで
-	#   毎回 2〜5 本が落ちるようになった。
-	#
-	#   実際にプロパティを 1 つ引けるまで待つ。
-	#
-	i=0
-	while [ $i -lt 100 ]; do
-		if xprop -display "$DISPLAY" -root >/dev/null 2>&1; then
-			return 0
+		i=0
+		_ok=0
+		while [ $i -lt 100 ]; do
+			if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+				break                       # 自分の Xvfb が死んだ (番号の取り合いに負けた)
+			fi
+			if [ -e "/tmp/.X${disp}-lock" ] &&
+			   xprop -display "$DISPLAY" -root >/dev/null 2>&1; then
+				_ok=1
+				break
+			fi
+			sleep 0.1
+			i=$((i + 1))
+		done
+
+		# 繋がった相手が本当に自分の Xvfb か、少し置いてもう一度確かめる
+		if [ "$_ok" -eq 1 ]; then
+			sleep 0.2
+			if kill -0 "$XVFB_PID" 2>/dev/null &&
+			   xprop -display "$DISPLAY" -root >/dev/null 2>&1; then
+				return 0
+			fi
 		fi
-		sleep 0.1
-		i=$((i + 1))
+
+		kill "$XVFB_PID" 2>/dev/null || true
+		_from=$((disp + 1))
+		_try=$((_try + 1))
 	done
-	fail "Xvfb が接続を受け付けません ($DISPLAY)"
+	fail "Xvfb を起動できません (5 回試行。最後に試した番号 :$disp、ログ /tmp/w98wm-test-xvfb-$$.log)"
 }
 
 # start_wm: $WM_BIN を起動し WM_PID を設定する。

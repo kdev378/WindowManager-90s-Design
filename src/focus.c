@@ -22,6 +22,61 @@ static void send_take_focus(struct client *c, xcb_timestamp_t time)
 	               (const char *)&ev);
 }
 
+/*
+ * キャプションの配色はアクティブ/非アクティブで変わる (§4.4)。
+ *
+ * ★ これを FocusIn/FocusOut イベントに任せてはいけない。
+ *   どのウィンドウにも FOCUS_CHANGE のイベントマスクを選んでいなかったため、
+ *   event.c にあった FocusIn ハンドラは**一度も呼ばれていなかった**。
+ *   キャプションは Expose のときしか描き直されず、色は「最後に Expose
+ *   された時点の状態」で固まっていた（外部テストで発見）。
+ *
+ *   しかも FocusIn は X の入力フォーカスに従うので、Globally Active
+ *   (WM が SetInputFocus を呼ばない) や No Input のクライアントでは
+ *   WM の「アクティブ」と一致しない。正はあくまで ST_FOCUSED であり、
+ *   それを書き換えた場所で描き直すのが唯一確実な方法である。
+ */
+static void redraw_caption(struct client *c)
+{
+	if (c != NULL && (c->flags & CF_DECORATED) && (c->flags & CF_MAPPED))
+		deco_draw(c, NULL);
+}
+
+/*
+ * click-to-focus のためのパッシブ grab (SPEC §3.6)。
+ *
+ * ★ これが無いと「窓の中身をクリックしてもアクティブにならない」。
+ *   フレームは ButtonPress を select しているが、xterm や GTK のように
+ *   アプリ自身が ButtonPress を select している窓では、イベントは
+ *   アプリに届いてフレームへは伝播しない。WM が受け取れるのは
+ *   **タイトルバーと枠のクリックだけ**になる。
+ *   event.c には ReplayPointer を呼ぶコードがあったのに grab を
+ *   張っていなかったため、ずっとこの状態だった（外部テストで発見。
+ *   既存テストは全部 _NET_ACTIVE_WINDOW で切り替えていて踏まなかった）。
+ *
+ * 方式は dwm と同じ: **非アクティブな窓だけ grab し、アクティブに
+ * なったら外す**。アクティブな窓の中のクリックには一切割り込まないので、
+ * 日常の操作で ReplayPointer の往復が挟まらない。
+ * pointer_mode を SYNC にして、受けたら必ず ReplayPointer で解放する
+ * (event.c の on_button_press)。
+ */
+void focus_grab_buttons(struct client *c, bool grab)
+{
+	if (c == NULL || (c->flags & CF_DESTROYED))
+		return;
+	if (wm.cfg.focus_mode != FOCUS_CLICK)
+		return;
+
+	if (grab)
+		xcb_grab_button(wm.conn, 0, c->win, XCB_EVENT_MASK_BUTTON_PRESS,
+		                XCB_GRAB_MODE_SYNC, XCB_GRAB_MODE_ASYNC,
+		                XCB_NONE, XCB_NONE,
+		                XCB_BUTTON_INDEX_ANY, XCB_MOD_MASK_ANY);
+	else
+		xcb_ungrab_button(wm.conn, XCB_BUTTON_INDEX_ANY, c->win,
+		                  XCB_MOD_MASK_ANY);
+}
+
 void focus_set(struct client *c, xcb_timestamp_t time)
 {
 	if (!c) { focus_none(); return; }
@@ -45,12 +100,20 @@ void focus_set(struct client *c, xcb_timestamp_t time)
 		send_take_focus(c, time);
 
 	struct client *old = wm.focused;
+	bool was_focused = (c->states & ST_FOCUSED) != 0;
 	if (old && old != c) old->states &= ~ST_FOCUSED;
 	c->states |= ST_FOCUSED;
 	wm.focused = c;
 
-	if (old && old != c) ewmh_set_wm_state(old);
+	if (old && old != c) {
+		ewmh_set_wm_state(old);
+		redraw_caption(old);
+		focus_grab_buttons(old, true);
+	}
 	ewmh_set_wm_state(c);
+	if (!was_focused)
+		redraw_caption(c);
+	focus_grab_buttons(c, false);
 	ewmh_update_active_window();
 
 	focus_mru_promote(c);
@@ -69,6 +132,8 @@ void focus_none(void)
 	if (old) {
 		old->states &= ~ST_FOCUSED;
 		ewmh_set_wm_state(old);
+		redraw_caption(old);
+		focus_grab_buttons(old, true);
 	}
 	wm.focused = NULL;
 
